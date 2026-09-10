@@ -22,7 +22,6 @@ find_package(OpenCV 4 REQUIRED)
 # Yaml-cpp 
 find_package(yaml-cpp REQUIRED)
 # Glog
-find_package(glog REQUIRED)
 # Ceres-solver
 find_package(Ceres REQUIRED)
 # PCL
@@ -43,6 +42,7 @@ include_directories(
   ${EIGEN3_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${GLOG_INCLUDE_DIRS}
   include
 )
 
@@ -69,7 +69,7 @@ target_link_libraries(${PROJECT_NAME}
                       rtklib
                       vikit_common
                       svo
-                      glog
+                      ${GLOG_LIBRARIES}
                       ${OpenCV_LIBS}
                       ${PCL_LIBRARIES})
 target_include_directories(${PROJECT_NAME}

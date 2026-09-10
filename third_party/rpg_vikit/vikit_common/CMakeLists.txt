@@ -10,13 +10,17 @@ SET(USE_ROS False) # Set False if you want to build this package without Catkin
 find_package(OpenCV 4 REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
-find_package(glog REQUIRED)
+if(NOT GLOG_FOUND)
+  list(APPEND CMAKE_MODULE_PATH "/usr/local/lib/cmake/Ceres")
+  find_package(Glog REQUIRED)
+endif()
 
 # Include dirs
 INCLUDE_DIRECTORIES(
   include
   ${EIGEN3_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${GLOG_INCLUDE_DIRS}
 )
 
 IF(USE_ROS)
@@ -44,7 +48,7 @@ ADD_LIBRARY(${PROJECT_NAME} SHARED ${SOURCEFILES})
 TARGET_LINK_LIBRARIES(${PROJECT_NAME}
   ${OpenCV_LIBS}
   yaml-cpp
-  glog::glog)
+  ${GLOG_LIBRARIES})
 # Link include directory
 target_include_directories(${PROJECT_NAME}
     PUBLIC ${PROJECT_SOURCE_DIR}/include

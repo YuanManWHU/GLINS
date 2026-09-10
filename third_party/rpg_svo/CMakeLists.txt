@@ -6,8 +6,11 @@ CMAKE_MINIMUM_REQUIRED (VERSION 2.8.3)
 # Add plain cmake packages 
 find_package(OpenCV 4 REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(glog REQUIRED)
-find_package(Ceres REQUIRED)
+# Ceres is normally provided by the parent GLINS project.
+# When rpg_svo is built independently, find it here.
+if(NOT Ceres_FOUND)
+  find_package(Ceres REQUIRED)
+endif()
 
 # Include dirs
 INCLUDE_DIRECTORIES(
@@ -15,6 +18,7 @@ INCLUDE_DIRECTORIES(
   ${EIGEN3_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${CERES_INCLUDE_DIRS}
+  ${GLOG_INCLUDE_DIRS}
 )
 
 SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
@@ -39,7 +43,7 @@ set(SOURCEFILES ${COMMON_DIR} ${DIRECT_DIR} ${SVO_DIR}
 ADD_LIBRARY(${PROJECT_NAME} SHARED ${SOURCEFILES})
 TARGET_LINK_LIBRARIES(${PROJECT_NAME}
                       vikit_common
-                      glog
+                      ${GLOG_LIBRARIES}
                       fast
                       ${OpenCV_LIBS}
                       ${CERES_LIBRARIES})
