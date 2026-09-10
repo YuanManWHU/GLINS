@@ -817,8 +817,13 @@ void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster
     // we always add IMU measurement to estimator at a given timestamp before we 
     // add other sensor measurements.
     EstimatorDataCluster& measurement = *it;
-    if (estimatorTypeContains(SensorType::IMU, type_) && 
-        measurement.timestamp > latest_imu_timestamp_) {
+    // LiDAR deskew needs IMU coverage through scan end, not only timebase.
+    double required_imu_timestamp = measurement.timestamp;
+    if (measurement.lidar) {
+      required_imu_timestamp = measurement.lidar->timefinal;
+    }
+    if (estimatorTypeContains(SensorType::IMU, type_) &&
+        required_imu_timestamp > latest_imu_timestamp_) {
       it++; continue;
     }
 

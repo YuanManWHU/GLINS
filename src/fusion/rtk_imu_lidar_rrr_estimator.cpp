@@ -241,10 +241,16 @@ bool RtkImuLidarRrrEstimator::addLidarMeasurementAndState(const ScanPtr& scan,
   // Propagate the state to the scan end time
   Transformation T_WB_prior, T_WB_base;
   SpeedAndBias Speedbias_prior, Speedbias_base;
-  getPoseEstimateAt(curScan()->timefinal, T_WB_prior);
-  getPoseEstimateAt(curScan()->timebase, T_WB_base);
-  getSpeedAndBiasEstimateAt(curScan()->timefinal, Speedbias_prior);
-  getSpeedAndBiasEstimateAt(curScan()->timebase, Speedbias_base);
+  const bool pose_final_ok = getPoseEstimateAt(curScan()->timefinal, T_WB_prior);
+  const bool pose_base_ok = getPoseEstimateAt(curScan()->timebase, T_WB_base);
+  const bool speed_final_ok = getSpeedAndBiasEstimateAt(curScan()->timefinal, Speedbias_prior);
+  const bool speed_base_ok = getSpeedAndBiasEstimateAt(curScan()->timebase, Speedbias_base);
+  if (!pose_final_ok || !pose_base_ok || !speed_final_ok || !speed_base_ok) {
+    LOG(ERROR) << "Unable to obtain LiDAR motion state for scan ["
+               << std::fixed << std::setprecision(9) << curScan()->timebase << ", "
+               << curScan()->timefinal << "].";
+    return false;
+  }
 
   Transformation T_WB_k, delta_T;
   Transformation T_B_L_inv = lidar_base_options_.T_B_L.inverse();
