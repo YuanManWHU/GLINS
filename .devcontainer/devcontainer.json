@@ -1,0 +1,71 @@
+{
+    "name": "glins_sjtu",
+    "image": "slam_grlins:latest",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/slam/glins_ws/,type=bind,consistency=cached",
+    "workspaceFolder": "/home/slam/glins_ws/",
+    "runArgs": [
+        "--net",
+        "host",
+        "--gpus",
+        "all",
+        "-e",
+        "DISPLAY=:1"
+        // ,
+        // "--device=/dev/dri:/dev/dri",
+        // "--privileged"
+    ],
+    "mounts": [
+        {
+            "source": "/media/ym/BLUE",
+            "target": "/media/ym/BLUE",
+            "type": "bind"
+        },
+        {
+            "source": "${localEnv:HOME}/.codex",
+            "target": "/home/slam/.codex",
+            "type": "bind"
+        },
+        // {
+        //     "source": "/media/ym/T7 Shield",
+        //     "target": "/media/ym/T7 Shield",
+        //     "type": "bind"
+        // },
+        {
+            "source": "/tmp/.X11-unix",
+            "target": "/tmp/.X11-unix",
+            "type": "bind"
+        }
+    ],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "zsh"
+            },
+            "extensions": [
+                "ms-vscode.cpptools",
+                "jeff-hykin.better-cpp-syntax",
+                "twxs.cmake",
+                "ms-vscode.cmake-tools",
+                "redhat.vscode-yaml",
+                "dbankier.vscode-quick-select",
+                "gruntfuggly.todo-tree",
+                "mutantdino.resourcemonitor",
+                "ryu1kn.partial-diff",
+                "formulahendry.code-runner",
+                "redhat.vscode-xml",
+                "mutantdino.resourcemonitor",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "donjayamanne.githistory",
+                "xaver.clang-format",
+                "openai.chatgpt",
+                "GitHub.copilot-chat",
+                "Ranch-Hand-Robotics.rde-ros-1",
+                "Gruntfuggly.todo-tree",
+                "ms-vscode.cpptools-themes",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cpp-devtools"
+            ]
+        }
+    }
+}
