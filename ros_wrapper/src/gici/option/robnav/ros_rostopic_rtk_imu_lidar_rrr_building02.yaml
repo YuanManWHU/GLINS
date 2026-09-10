@@ -1,0 +1,355 @@
+# RobNav building02
+# GLINS tightly-coupled RTK / IMU / LiDAR RRR
+
+stream:
+  streamers:
+
+  # --------------------------------------------------------------------------
+  # GNSS rover
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_ros_gnss_rov
+      type: ros
+      topic_name: /gnss_rover
+      io: input
+      queue_size: 10000
+      format: gnss_raw
+      enable_observation: true
+
+  # --------------------------------------------------------------------------
+  # GNSS reference + reference position + broadcast ephemeris
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_ros_gnss_ref
+      type: ros
+      topic_name: /gnss_reference
+      io: input
+      queue_size: 10000
+      format: gnss_raw
+      enable_observation: true
+      enable_antenna_position: true
+      enable_ephemeris: true
+
+  # --------------------------------------------------------------------------
+  # IMU: ADIS16465
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_ros_imu
+      type: ros
+      topic_name: /adi/adis16465/imu
+      io: input
+      queue_size: 100000
+      format: imu
+
+  # --------------------------------------------------------------------------
+  # LiDAR: Hesai AT128
+  # sample_interval = 10 is implemented in the AT128 callback
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_ros_lidar
+      type: ros
+      topic_name: /hesai/at128/points
+      io: input
+      queue_size: 100000
+      format: hesai_at128
+
+  # --------------------------------------------------------------------------
+  # DCB
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_dcb_file
+      output_tags: [fmt_dcb_file]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/DCB/2025/CAS0MGXRAP_20251190000_01D_01D_DCB.BSX
+      enable_time_tag: false
+
+  # --------------------------------------------------------------------------
+  # Outputs
+  # --------------------------------------------------------------------------
+  - streamer:
+      tag: str_solution
+      type: ros
+      topic_name: solution
+      queue_size: 10
+      io: output
+      format: pose_stamped
+
+  - streamer:
+      tag: str_solution_odometry
+      type: ros
+      topic_name: solution_odometry
+      queue_size: 10
+      io: output
+      format: odometry
+      subframe_id: Body
+
+  - streamer:
+      tag: str_solution_navsatfix
+      type: ros
+      topic_name: solution_navsatfix
+      queue_size: 100
+      io: output
+      format: navsatfix
+
+  - streamer:
+      tag: str_solution_path
+      type: ros
+      topic_name: solution_path
+      queue_size: 100
+      io: output
+      format: path
+
+  - streamer:
+      tag: str_current_scan
+      type: ros
+      topic_name: cloud_current
+      queue_size: 100000
+      io: output
+      format: pointcloud2
+
+  - streamer:
+      tag: str_map
+      type: ros
+      topic_name: cloud_map
+      queue_size: 100000
+      io: output
+      format: map
+
+  - streamer:
+      tag: str_landmark
+      type: ros
+      topic_name: landmark
+      queue_size: 100000
+      marker_scale: 0.1
+      io: output
+      format: landmark
+
+  formators:
+
+  - formator:
+      io: input
+      tag: fmt_dcb_file
+      type: dcb-file
+
+
+estimate:
+
+- estimator:
+    tag: est_rtk_imu_lidar_rrr
+    type: rtk_imu_lidar_rrr
+
+    input_tags:
+      [str_ros_gnss_rov,
+       str_ros_gnss_ref,
+       fmt_dcb_file,
+       str_ros_imu,
+       str_ros_lidar]
+
+    str_ros_gnss_rov_roles: [rover]
+    str_ros_gnss_ref_roles: [reference, ephemeris]
+    fmt_dcb_file_roles: [code_bias]
+    str_ros_imu_roles: [major]
+    str_ros_lidar_roles: [front]
+
+    output_tags:
+      [str_solution,
+       str_solution_odometry,
+       str_solution_navsatfix,
+       str_solution_path,
+       str_current_scan,
+       str_map,
+       str_landmark]
+
+    # IMU 200 Hz / 40 = nominal 5 Hz output
+    output_align_tag: str_ros_imu
+    output_downsample_rate: 40
+
+    # Do not spend extra computation generating covariance for ROS output.
+    # Internal yaw covariance and ambiguity covariance are still computed
+    # explicitly when required by RRR.
+    compute_covariance: false
+
+    # Official RRR does not require input alignment.
+    enable_input_align: true
+    input_align_latency: 0.1
+
+    # ------------------------------------------------------------------------
+    # RRR
+    # ------------------------------------------------------------------------
+    rtk_imu_lidar_rrr_options:
+      max_keyframes: 3
+      max_gnss_window_length_minor: 3
+
+      # LiDAR initialization requires yaw STD <= 0.5 deg.
+      min_yaw_std_init_lidar: 0.5
+
+    # ------------------------------------------------------------------------
+    # RTK
+    # ------------------------------------------------------------------------
+    rtk_options:
+      max_window_length: 3
+      use_ambiguity_resolution: true
+      estimate_velocity: true
+      max_age: 20.0
+
+    # ------------------------------------------------------------------------
+    # GNSS
+    # ------------------------------------------------------------------------
+    gnss_estimator_base_options:
+
+      gnss_common:
+        # GPS + Galileo + BeiDou
+        # Exclude GLONASS + QZSS
+        system_exclude: [R, J]
+
+        min_elevation: 12.0
+        min_SNR: [35.0, 30.0]
+        max_gdop: 20.0
+        period: 1.0
+
+      gnss_error_parameter:
+        doppler_error_factor: 1.0
+
+      use_outlier_rejection: true
+      reject_one_outlier_once: false
+
+      # Official RRR thresholds
+      max_pesudorange_error: 10.0
+      max_phaserange_error: 0.1
+      max_doppler_error: 1.0
+
+    # ------------------------------------------------------------------------
+    # IMU
+    # ------------------------------------------------------------------------
+    imu_estimator_base_options:
+
+      imu_parameters:
+        rate: 200
+
+        sigma_bg: 2.424068e-04
+        sigma_ba: 5.000000e-04
+
+        sigma_g_c: 2.908882e-05
+        sigma_a_c: 1.666667e-03
+
+        sigma_gw_c: 5.713584e-06
+        sigma_aw_c: 1.178511e-05
+
+      # IMU FRD -> GLINS body RFU
+      body_to_imu_rotation: [180.0, 0.0, 90.0]
+
+      # Disable vehicle-specific priors for fair comparison.
+      car_motion: true
+      # 机器人速度不高，官方默认 3 m/s 太大
+      car_motion_min_velocity: 0.5
+
+      car_motion_max_anguler_velocity: 5.0
+
+      # IMPORTANT:
+      # RRR calls addZUPTResidualBlock() unconditionally.
+      # Setting use_zupt=false alone is not sufficient in current GLINS.
+      use_zupt: false
+      zupt_duration: 0.0
+
+    # ------------------------------------------------------------------------
+    # Main optimizer
+    # ------------------------------------------------------------------------
+    estimator_base_options:
+      max_iteration: 10
+      num_threads: 6
+      max_solver_time: 0.03
+
+      # Keep false for actual runtime comparison.
+      verbose_output: false
+
+      solver_type: dense_schur
+      trust_region_strategy_type: dogleg
+
+    # ------------------------------------------------------------------------
+    # Ambiguity resolution
+    # ------------------------------------------------------------------------
+    ambiguity_resolution_options:
+      system_exclude: [R, J]
+
+      # Default AR elevation threshold in GLINS.
+      min_elevation: 15.0
+
+      min_percentage_fixation_uwl: 1.0
+      min_percentage_fixation_wl: 0.9
+      min_percentage_fixation_nl: 0.9
+
+      ratio: 2.0
+
+    # ------------------------------------------------------------------------
+    # GNSS / IMU initialization
+    # ------------------------------------------------------------------------
+    gnss_imu_initializer_options:
+      max_iteration: 30
+      num_threads: 4
+      max_solver_time: 0.5
+
+      # Antenna position relative to IMU, expressed in IMU FRD.
+      # GLINS rotates it internally to body RFU.
+      gnss_extrinsics: [0.0, -0.07, -0.365]
+
+      # Exactly fix the calibrated lever arm.
+      gnss_extrinsics_initial_std: [0.0, 0.0, 0.0]
+
+      time_window_length_slow_motion: 0.1
+      time_window_length_dynamic_motion: 3.0
+
+      # car_motion=false => yaw initialization relies on dynamic acceleration.
+      min_acceleration: 1.0
+
+    # ------------------------------------------------------------------------
+    # LiDAR
+    # ------------------------------------------------------------------------
+    lidar_estimator_base_options:
+      blind: 2.0
+
+      # Official RRR LiDAR settings
+      var: 1.0e-1
+      robust_loss_scale: 2.0
+      landmark_var: 1.0e-1
+
+      kfselect_max_rotation: 10.0
+      kfselect_max_translation: 10.0
+      kfselect_min_dt: 0.8
+
+      # IMPORTANT:
+      # Although named T_B_L, the YAML value must be T_I_L here because
+      # MultisensorEstimating subsequently premultiplies T_BI.
+      T_B_L:
+        cols: 4
+        rows: 4
+        data: [
+           0.99993733, -0.00698769, -0.00874728,  0.07000000,
+          -0.00699973, -0.99997459, -0.00134683, -0.02000000,
+          -0.00873764,  0.00140797, -0.99996083, -0.02000000,
+           0.00000000,  0.00000000,  0.00000000,  1.00000000
+        ]
+
+    # ------------------------------------------------------------------------
+    # LiDAR voxel / plane handler
+    # ------------------------------------------------------------------------
+    tree_handler_options:
+      filter_radius: 0.8
+      std_range: 0.03
+      std_angle: 0.1
+
+      max_near_dis: 1.0
+      max_plane_dis: 0.1
+
+      merge_size: 25
+      voxel_size: 3.0
+      max_layer: 2
+      max_points_num: 50
+
+      plane_threshold: 1.0e-1
+
+
+logging:
+  enable: true
+  min_log_level: 0
+  log_to_stderr: true
+  file_directory: log

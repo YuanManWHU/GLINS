@@ -1,0 +1,143 @@
+# RobNav building02 standalone RTK configuration
+
+stream:
+  streamers:
+
+  # Rover observations
+  - streamer:
+      tag: str_ros_gnss_rov
+      type: ros
+      topic_name: /gnss_rover
+      io: input
+      queue_size: 10000
+      format: gnss_raw
+      enable_observation: true
+
+  # Reference observations + reference position + broadcast ephemerides
+  - streamer:
+      tag: str_ros_gnss_ref
+      type: ros
+      topic_name: /gnss_reference
+      io: input
+      queue_size: 10000
+      format: gnss_raw
+      enable_observation: true
+      enable_antenna_position: true
+      enable_ephemeris: true
+
+  # DCB
+  - streamer:
+      tag: str_dcb_file
+      output_tags: [fmt_dcb_file]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/DCB/2025/CAS0MGXRAP_20251190000_01D_01D_DCB.BSX
+      enable_time_tag: false
+
+  # ROS outputs
+  - streamer:
+      tag: str_solution
+      type: ros
+      topic_name: solution
+      queue_size: 10
+      io: output
+      format: pose_stamped
+
+  - streamer:
+      tag: str_solution_odometry
+      type: ros
+      topic_name: solution_odometry
+      queue_size: 10
+      io: output
+      format: odometry
+      subframe_id: Body
+
+  - streamer:
+      tag: str_solution_navsatfix
+      type: ros
+      topic_name: solution_navsatfix
+      queue_size: 100
+      io: output
+      format: navsatfix
+
+  - streamer:
+      tag: str_solution_path
+      type: ros
+      topic_name: solution_path
+      queue_size: 100
+      io: output
+      format: path
+
+  formators:
+
+  - formator:
+      io: input
+      tag: fmt_dcb_file
+      type: dcb-file
+
+estimate:
+
+- estimator:
+    tag: est_gnss
+    type: rtk
+
+    input_tags:
+      [str_ros_gnss_rov,
+       str_ros_gnss_ref,
+       fmt_dcb_file]
+
+    str_ros_gnss_rov_roles: [rover]
+    str_ros_gnss_ref_roles: [reference, ephemeris]
+    fmt_dcb_file_roles: [code_bias]
+
+    output_tags:
+      [str_solution,
+       str_solution_odometry,
+       str_solution_path,
+       str_solution_navsatfix]
+
+    output_align_tag: str_ros_gnss_rov
+    output_downsample_rate: 1
+    compute_covariance: true
+
+    rtk_options:
+      max_window_length: 3
+      use_ambiguity_resolution: true
+      estimate_velocity: true
+
+    gnss_estimator_base_options:
+      gnss_common:
+        # Use GPS + Galileo + BeiDou.
+        # Exclude GLONASS and QZSS.
+        system_exclude: [R, J]
+
+        min_elevation: 12.0
+        min_SNR: [35.0, 30.0]
+        max_gdop: 5.0
+        period: 1.0
+
+      use_outlier_rejection: true
+      reject_one_outlier_once: false
+
+      max_pesudorange_error: 4.0
+      max_phaserange_error: 0.03
+
+    estimator_base_options:
+      max_iteration: 10
+      num_threads: 2
+      max_solver_time: 0.05
+      verbose_output: false
+      solver_type: dense_schur
+      trust_region_strategy_type: dogleg
+
+    ambiguity_resolution_options:
+      system_exclude: [R, J]
+      min_percentage_fixation_uwl: 1.0
+      min_percentage_fixation_wl: 0.9
+      min_percentage_fixation_nl: 0.9
+      ratio: 2.0
+
+logging:
+  enable: true
+  min_log_level: 0
+  log_to_stderr: true
+  file_directory: log
