@@ -76,3 +76,4 @@ bin/
 lib/
 *.atx
 results/
+*.pyc
