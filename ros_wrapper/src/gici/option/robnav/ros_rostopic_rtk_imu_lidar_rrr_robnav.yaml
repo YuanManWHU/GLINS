@@ -256,7 +256,7 @@ estimate:
     # ------------------------------------------------------------------------
     estimator_base_options:
       max_iteration: 10
-      num_threads: 6
+      num_threads: 1
       max_solver_time: 0.03
 
       # Keep false for actual runtime comparison.
@@ -285,7 +285,7 @@ estimate:
     # ------------------------------------------------------------------------
     gnss_imu_initializer_options:
       max_iteration: 30
-      num_threads: 4
+      num_threads: 1
       max_solver_time: 0.5
 
       # Antenna position relative to IMU, expressed in IMU FRD.

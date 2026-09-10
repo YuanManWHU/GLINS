@@ -11,6 +11,7 @@
 #include <iomanip>
 
 #include "gici/gnss/position_error.h"
+#include "gici/utility/experiment_recorder.h"
 
 namespace gici {
 
@@ -67,7 +68,12 @@ bool RtkImuLidarRrrEstimator::addMeasurement(const EstimatorDataCluster& measure
 {
   // GNSS/IMU initialization
   if (coordinate_ == nullptr || !gravity_setted_) return false;
+  const TimingTrigger measurement_trigger = measurement.lidar ? TimingTrigger::Lidar :
+      (measurement.gnss ? TimingTrigger::Gnss :
+       (measurement.imu ? TimingTrigger::Imu : TimingTrigger::None));
   if (!gnss_imu_initializer_->finished()) {
+    ScopedModuleTimer timer(TimingModule::Initialization, measurement.timestamp,
+                            measurement_trigger);
     if (gnss_imu_initializer_->getCoordinate() == nullptr) {
       gnss_imu_initializer_->setCoordinate(coordinate_);
       initializer_sub_estimator_->setCoordinate(coordinate_);
@@ -93,20 +99,31 @@ bool RtkImuLidarRrrEstimator::addMeasurement(const EstimatorDataCluster& measure
       ambiguity_covariance_estimator_->setCoordinate(coordinate_);
       ambiguity_covariance_coordinate_set_ = true;
     }
-    if (coordinate_ && ambiguity_covariance_estimator_->addMeasurement(measurement)) {
-      ambiguity_covariance_estimator_->estimate();
+    if (coordinate_) {
+      ScopedModuleTimer timer(TimingModule::GnssAuxRtk, measurement.timestamp,
+                              TimingTrigger::Gnss);
+      if (ambiguity_covariance_estimator_->addMeasurement(measurement)) {
+        ambiguity_covariance_estimator_->estimate();
+      }
     }
     // Align local rover and reference measurements
     GnssMeasurement rov, ref;
     measurement_align_.add(measurement);
     if (measurement_align_.get(rtk_options_.max_age, rov, ref)) {
+      ScopedModuleTimer timer(TimingModule::GnssFactor, rov.timestamp, TimingTrigger::Gnss);
       return addGnssMeasurementAndState(rov, ref);
     }
   }
 
   // Add LiDAR
   if (measurement.lidar) {
-    if (!lidar_initialized_) return lidarInitialization(measurement.lidar);
+    if (!lidar_initialized_) {
+      ScopedModuleTimer timer(TimingModule::LidarInitialization, measurement.lidar->timefinal,
+                              TimingTrigger::Lidar);
+      return lidarInitialization(measurement.lidar);
+    }
+    ScopedModuleTimer timer(TimingModule::LidarFactor, measurement.lidar->timefinal,
+                            TimingTrigger::Lidar);
     return addLidarMeasurementAndState(measurement.lidar);
   }
 
@@ -353,7 +370,15 @@ bool RtkImuLidarRrrEstimator::estimate()
 {
   status_ = EstimatorStatus::Converged;
 
-  optimize();
+  const IdType pending_state_type = states_[latest_state_index_].id.type();
+  const TimingTrigger timing_trigger = pending_state_type == IdType::gPose
+      ? TimingTrigger::Gnss
+      : (pending_state_type == IdType::lPose ? TimingTrigger::Lidar : TimingTrigger::None);
+  const double state_timestamp = states_[latest_state_index_].timestamp;
+  {
+    ScopedModuleTimer timer(TimingModule::Optimization, state_timestamp, timing_trigger);
+    optimize();
+  }
 
   State& new_state = states_[latest_state_index_];
   IdType new_state_type = states_[latest_state_index_].id.type();
@@ -366,6 +391,7 @@ bool RtkImuLidarRrrEstimator::estimate()
   }
 
   if (new_state_type == IdType::gPose) {
+    ScopedModuleTimer timer(TimingModule::GnssPost, new_state.timestamp, TimingTrigger::Gnss);
     // Reject GNSS outliers
     size_t n_pseudorange = numPseudorangeError(states_[latest_state_index_]);
     size_t n_phaserange = numPhaserangeError(states_[latest_state_index_]);
@@ -441,6 +467,7 @@ bool RtkImuLidarRrrEstimator::estimate()
 
   // LiDAR processing
   if (new_state_type == IdType::lPose) {
+    ScopedModuleTimer timer(TimingModule::LidarPost, new_state.timestamp, TimingTrigger::Lidar);
     // Update point cloud map for visualization
     updateCloudMap(new_state);
 
@@ -462,7 +489,10 @@ bool RtkImuLidarRrrEstimator::estimate()
     tree_handler_->mapSlide(getPoseEstimate(new_state).getPosition());
   }
 
-  marginalization(new_state_type);
+  {
+    ScopedModuleTimer timer(TimingModule::Marginalization, new_state.timestamp, timing_trigger);
+    marginalization(new_state_type);
+  }
 
   // Shift memory for states and measurements
   if (new_state_type == IdType::gPose) {

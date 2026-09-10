@@ -75,3 +75,4 @@ data*/
 bin/
 lib/
 *.atx
+results/

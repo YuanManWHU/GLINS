@@ -11,6 +11,7 @@
 #include "gici/imu/imu_common.h"
 #include "gici/imu/imu_error.h"
 #include "gici/utility/spin_control.h"
+#include "gici/utility/experiment_recorder.h"
 #include "gici/gnss/ppp_estimator.h"
 #include "gici/gnss/sdgnss_estimator.h"
 #include "gici/gnss/dgnss_estimator.h"
@@ -474,6 +475,8 @@ MultiSensorEstimating::~MultiSensorEstimating()
   if (backend_thread_) {
     backend_thread_->join(); backend_thread_ = nullptr;
   }
+  // All producer threads have stopped, so the recorder can safely write its snapshots.
+  ExperimentRecorder::instance().flush();
 }
 
 // Reset estimator
@@ -745,6 +748,7 @@ bool MultiSensorEstimating::updateSolution()
   output_timestamps_.pop_front();
   mutex_output_.unlock();
 
+  ExperimentRecorder::instance().recordNav(solution_, imu_base_options_);
   return true;
 }
 
@@ -981,11 +985,23 @@ bool MultiSensorEstimating::processEstimator()
 
   // Process estimator
   bool is_updated = false;
+  const TimingTrigger timing_trigger = measurement.lidar ? TimingTrigger::Lidar :
+      (measurement.gnss ? TimingTrigger::Gnss :
+       (measurement.imu ? TimingTrigger::Imu : TimingTrigger::None));
 
-  // add measurement
-  if (estimator_->addMeasurement(measurement)) {
-    // solve
-    if (estimator_->estimate()) is_updated = true;
+  // Coarse timers deliberately enclose the existing backend calls without changing their result.
+  bool measurement_added = false;
+  {
+    ScopedModuleTimer timer(TimingModule::BackendAdd, measurement.timestamp, timing_trigger,
+                            TimingScope::Coarse);
+    measurement_added = estimator_->addMeasurement(measurement);
+  }
+  if (measurement_added) {
+    {
+      ScopedModuleTimer timer(TimingModule::BackendEstimate, measurement.timestamp, timing_trigger,
+                              TimingScope::Coarse);
+      if (estimator_->estimate()) is_updated = true;
+    }
     // check if estimator valid
     if (estimator_->getStatus() == EstimatorStatus::Diverged) {
       // reset estimator
@@ -1135,65 +1151,76 @@ void MultiSensorEstimating::runLidarFrontend()
       last_lidar_pending_num_ = lidar_frontend_measurements_.size();
     }
 
-    // Fetch data
-    std::shared_ptr<LidarMeasurement> lidar =
-        std::make_shared<LidarMeasurement>(*front_measurement.lidar);
-
-    double timebase = lidar->timebase;
-    std::string tag = front_measurement.tag;
-    LidarRole role = front_measurement.lidar_role;
-    last_lidar_timestamp = front_measurement.timestamp;
-
-    lidar_frontend_measurements_.pop_front();
-    mutex_lidar_input_.unlock();
-
-    std::shared_ptr<LidarMeasurement> scan =
-        std::make_shared<LidarMeasurement>(lidar->timebase, lidar->timefinal, lidar->seq);
-    scan->need_frontend = false;
-    scan->cloud_ptr = lidar->cloud_ptr;
-
-    Transformation T_WS;
-
-    // Process the LiDAR scan in the frontend
-    tree_handler_->processLidar(scan);
-
-    // Output plane landmarks for ROS visualization
-    std::shared_ptr<DataCluster> data_planes =
-        std::make_shared<DataCluster>(tree_handler_->visualizePlanes());
-    data_planes->planes->header.stamp = static_cast<uint64_t>(timebase * 1e9);
-
-    for (auto& callback : output_data_callbacks_) {
-      callback(tag_, data_planes);
-    }
-
-    // Send processed scan to backend
-    EstimatorDataCluster measurement(*scan, role, tag);
-    estimatorDataCallback(measurement);
-
-    // Output current map for ROS visualization
-    std::shared_ptr<DataCluster> data_map =
-        std::make_shared<DataCluster>(tree_handler_->getMap(), FormatorType::LaserMap);
-    data_map->laser_map->header.stamp = timebase;
-
-    for (auto& callback : output_data_callbacks_) {
-      callback(tag_, data_map);
-    }
-
-    // Output current scan for ROS visualization
-    std::shared_ptr<DataCluster> data_cluster =
-        std::make_shared<DataCluster>(FormatorType::PointCloud2);
-
-    // Transform point cloud from LiDAR frame to body frame for visualization
-    Cloud_ptr cloud_body(new Cloud());
-    pcl::transformPointCloud(*lidar->cloud_ptr, *cloud_body,
-                             tree_handler_->transTomat(lidar_estimator_base_options_.T_B_L), true);
-
-    data_cluster->lidar->cloud_ptr.reset(new Cloud(*cloud_body));
-    data_cluster->lidar->timebase = timebase;
-    data_cluster->lidar->valid_num = cloud_body->size();
-
-    for (auto& callback : output_data_callbacks_) {
-      callback(tag_, data_cluster);
+    {
+      // Coarse timing excludes queue wait and sleep, but covers the complete active frontend work.
+      ScopedModuleTimer frontend_timer(TimingModule::LidarFrontendTotal,
+                                       front_measurement.lidar->timefinal, TimingTrigger::Lidar,
+                                       TimingScope::Coarse);
+  
+      // Fetch data
+      std::shared_ptr<LidarMeasurement> lidar =
+          std::make_shared<LidarMeasurement>(*front_measurement.lidar);
+  
+      double timebase = lidar->timebase;
+      std::string tag = front_measurement.tag;
+      LidarRole role = front_measurement.lidar_role;
+      last_lidar_timestamp = front_measurement.timestamp;
+  
+      lidar_frontend_measurements_.pop_front();
+      mutex_lidar_input_.unlock();
+  
+      std::shared_ptr<LidarMeasurement> scan =
+          std::make_shared<LidarMeasurement>(lidar->timebase, lidar->timefinal, lidar->seq);
+      scan->need_frontend = false;
+      scan->cloud_ptr = lidar->cloud_ptr;
+  
+      Transformation T_WS;
+  
+      // Detail timing is limited to LiDAR preprocessing.
+      {
+        ScopedModuleTimer timer(TimingModule::LidarPreprocess, scan->timefinal,
+                                TimingTrigger::Lidar);
+        tree_handler_->processLidar(scan);
+      }
+  
+      // Output plane landmarks for ROS visualization
+      std::shared_ptr<DataCluster> data_planes =
+          std::make_shared<DataCluster>(tree_handler_->visualizePlanes());
+      data_planes->planes->header.stamp = static_cast<uint64_t>(timebase * 1e9);
+  
+      for (auto& callback : output_data_callbacks_) {
+        callback(tag_, data_planes);
+      }
+  
+      // Send processed scan to backend
+      EstimatorDataCluster measurement(*scan, role, tag);
+      estimatorDataCallback(measurement);
+  
+      // Output current map for ROS visualization
+      std::shared_ptr<DataCluster> data_map =
+          std::make_shared<DataCluster>(tree_handler_->getMap(), FormatorType::LaserMap);
+      data_map->laser_map->header.stamp = timebase;
+  
+      for (auto& callback : output_data_callbacks_) {
+        callback(tag_, data_map);
+      }
+  
+      // Output current scan for ROS visualization
+      std::shared_ptr<DataCluster> data_cluster =
+          std::make_shared<DataCluster>(FormatorType::PointCloud2);
+  
+      // Transform point cloud from LiDAR frame to body frame for visualization
+      Cloud_ptr cloud_body(new Cloud());
+      pcl::transformPointCloud(*lidar->cloud_ptr, *cloud_body,
+                               tree_handler_->transTomat(lidar_estimator_base_options_.T_B_L), true);
+  
+      data_cluster->lidar->cloud_ptr.reset(new Cloud(*cloud_body));
+      data_cluster->lidar->timebase = timebase;
+      data_cluster->lidar->valid_num = cloud_body->size();
+  
+      for (auto& callback : output_data_callbacks_) {
+        callback(tag_, data_cluster);
+      }
     }
     spin.sleep();
   }
