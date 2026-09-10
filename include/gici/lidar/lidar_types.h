@@ -8,6 +8,7 @@
 #pragma once
 #define PCL_NO_PRECOMPILE
 
+#include <cstdint>
 #include <iostream>
 #include <vector>
 #include <deque>
@@ -173,6 +174,15 @@ struct EIGEN_ALIGN16 PointXYZIRT {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// Hesai AT128 PointCloud2 input. timestamp is an absolute Unix/ROS timestamp in seconds.
+struct EIGEN_ALIGN16 PointXYZIRTAT128 {
+  PCL_ADD_POINT4D
+  PCL_ADD_INTENSITY
+  std::uint16_t ring;
+  double timestamp;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
 }  // namespace gici
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(gici::PointXYZIRT,
@@ -180,6 +190,11 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(gici::PointXYZIRT,
                                                              z)(float, intensity,
                                                                 intensity)(std::uint16_t, ring,
                                                                            ring)(float, time, time))
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
+    gici::PointXYZIRTAT128,
+    (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(std::uint16_t, ring, ring)(
+        double, timestamp, timestamp))
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(
     gici::PointXYZINormalCov,

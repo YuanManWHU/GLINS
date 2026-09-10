@@ -8,7 +8,9 @@
 **/
 #include "gici/ros_interface/ros_stream.h"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
@@ -100,6 +102,15 @@ RosStream::RosStream(
           topic_name_, queue_size_, boost::bind(&RosStream::pc2Callback, this, _1)));
     } else {
       publishers_.push_back(nh_.advertise<sensor_msgs::PointCloud2>(topic_name_, queue_size_));
+    }
+  } else if (data_format == "hesai_at128") {
+    data_format_ = RosDataFormat::PointCloud2;
+    if (io_type_ == StreamIOType::Input) {
+      subscribers_.push_back(nh_.subscribe<sensor_msgs::PointCloud2>(
+          topic_name_, queue_size_, boost::bind(&RosStream::hesaiAt128Callback, this, _1)));
+    } else {
+      LOG(ERROR) << "Setting Hesai AT128 topic as output is disabled!";
+      return;
     }
   } else if (data_format == "imu") {
     data_format_ = RosDataFormat::Imu;
@@ -626,6 +637,90 @@ void RosStream::livoxCallback(const livox_ros_driver::CustomMsg::ConstPtr& msg)
   }
   // Call logger pipeline
   for (auto pipeline : pipeline_ros_to_ros_) {
+    pipeline("", data_cluster);
+  }
+}
+
+void RosStream::hesaiAt128Callback(const sensor_msgs::PointCloud2::ConstPtr& msg)
+{
+  std::shared_ptr<DataCluster> data_cluster =
+      std::make_shared<DataCluster>(FormatorType::PointCloud2);
+
+  // AT128 timestamps are absolute seconds, so keep them in double precision until differencing.
+  pcl::PointCloud<PointXYZIRTAT128>::Ptr cloud_ptr(new pcl::PointCloud<PointXYZIRTAT128>);
+  pcl::fromROSMsg(*msg, *cloud_ptr);
+
+  if (cloud_ptr->empty()) {
+    LOG(WARNING) << "Received an empty Hesai AT128 PointCloud2 message; skipping it.";
+    return;
+  }
+
+  const double base_time = msg->header.stamp.toSec();
+  double min_relative_time = std::numeric_limits<double>::infinity();
+  double max_relative_time = -std::numeric_limits<double>::infinity();
+
+  Cloud scan;
+  scan.reserve(cloud_ptr->size());
+  constexpr std::size_t kSampleInterval = 10;
+
+  for (std::size_t i = 0; i < cloud_ptr->points.size(); i += kSampleInterval) {
+    const auto& src_point = cloud_ptr->points[i];
+
+    if (!std::isfinite(src_point.x) ||
+        !std::isfinite(src_point.y) ||
+        !std::isfinite(src_point.z) ||
+        !std::isfinite(src_point.timestamp)) {
+      continue;
+    }
+
+    const double relative_time =
+        src_point.timestamp - base_time;
+
+    min_relative_time =
+        std::min(min_relative_time, relative_time);
+    max_relative_time =
+        std::max(max_relative_time, relative_time);
+
+    Point_lidar point;
+    point.x = src_point.x;
+    point.y = src_point.y;
+    point.z = src_point.z;
+    point.intensity = src_point.intensity;
+    point.curvature = static_cast<float>(relative_time);
+    point.normal_z = static_cast<float>(src_point.ring);
+
+    scan.push_back(point);
+  }
+
+  if (!std::isfinite(max_relative_time)) {
+    LOG(WARNING) << "Hesai AT128 scan contains no valid point timestamps; skipping it.";
+    return;
+  }
+  if (scan.empty()) {
+    LOG(WARNING) << "Hesai AT128 scan contains no valid points; skipping it.";
+    return;
+  }
+
+  data_cluster->lidar->cloud_ptr.reset(new Cloud(std::move(scan)));
+  data_cluster->lidar->timebase = base_time;
+  data_cluster->lidar->timefinal = base_time + max_relative_time;
+  data_cluster->lidar->valid_num = data_cluster->lidar->cloud_ptr->size();
+  data_cluster->lidar->seq = msg->header.seq;
+
+  VLOG(1) << "AT128 seq=" << data_cluster->lidar->seq
+          << " raw_points=" << cloud_ptr->size()
+          << " sampled_points=" << data_cluster->lidar->valid_num
+          << " sample_interval=" << kSampleInterval
+          << " timebase=" << base_time
+          << " min_dt=" << min_relative_time
+          << " max_dt=" << max_relative_time
+          << " timefinal=" << data_cluster->lidar->timefinal;
+
+  // Forward the LiDAR scan through the unchanged estimator and logging pipelines.
+  for (const auto& it_lidar_callback : data_callbacks_) {
+    it_lidar_callback(tag_, data_cluster);
+  }
+  for (const auto& pipeline : pipeline_ros_to_ros_) {
     pipeline("", data_cluster);
   }
 }

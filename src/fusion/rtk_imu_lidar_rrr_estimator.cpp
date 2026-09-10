@@ -195,9 +195,9 @@ bool RtkImuLidarRrrEstimator::addGnssMeasurementAndState(const GnssMeasurement& 
   // Car motion
   if (imu_base_options_.car_motion) {
     // Heading measurement constraint
-    addHMCResidualBlock(states_[index]);
+    // addHMCResidualBlock(states_[index]);
     // Non-holonomic constraint
-    addNHCResidualBlock(states_[index]);
+    // addNHCResidualBlock(states_[index]);
   }
 
   // Compute DOP

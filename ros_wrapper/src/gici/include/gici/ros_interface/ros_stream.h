@@ -128,6 +128,7 @@ private:
   void imuCallback(const sensor_msgs::ImuConstPtr& msg);
   void livoxCallback(const livox_ros_driver::CustomMsg::ConstPtr& msg);
   void pc2Callback(const sensor_msgs::PointCloud2::ConstPtr& msg);
+  void hesaiAt128Callback(const sensor_msgs::PointCloud2::ConstPtr& msg);
   void gnssObservationsCallback(const gici_ros::GnssObservationsConstPtr& msg);
   void gnssEphemeridesCallback(const gici_ros::GnssEphemeridesConstPtr& msg);
   void gnssAntennaPositionCallback(const gici_ros::GnssAntennaPositionConstPtr& msg);
