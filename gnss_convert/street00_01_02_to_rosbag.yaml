@@ -1,0 +1,169 @@
+stream:
+  streamers:
+
+  # =================================================================
+  # Rover observations
+  # =================================================================
+
+  - streamer:
+      tag: str_rov_street00
+      output_tags: [fmt_rov_street00]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street00/719/20250428-02.25O
+
+  - streamer:
+      tag: str_rov_street01
+      output_tags: [fmt_rov_street01]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street01/719/20250428-03.25O
+
+  - streamer:
+      tag: str_rov_street02
+      output_tags: [fmt_rov_street02]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street02/719/20250428-04.25O
+
+
+  # =================================================================
+  # Reference observation
+  # =================================================================
+
+  - streamer:
+      tag: str_gnss_ref
+      output_tags: [fmt_gnss_ref]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25O
+
+
+  # =================================================================
+  # Broadcast ephemerides
+  # =================================================================
+
+  - streamer:
+      tag: str_eph_gps
+      output_tags: [fmt_eph_gps]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25N
+
+  - streamer:
+      tag: str_eph_glo
+      output_tags: [fmt_eph_glo]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25G
+
+  - streamer:
+      tag: str_eph_bds
+      output_tags: [fmt_eph_bds]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25F
+
+  - streamer:
+      tag: str_eph_gal
+      output_tags: [fmt_eph_gal]
+      type: file
+      path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25L
+
+
+  # =================================================================
+  # Formators
+  # =================================================================
+
+  formators:
+
+  - formator:
+      io: input
+      tag: fmt_rov_street00
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_rov_street01
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_rov_street02
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_gnss_ref
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_eph_gps
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_eph_glo
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_eph_bds
+      type: gnss-rinex
+
+  - formator:
+      io: input
+      tag: fmt_eph_gal
+      type: gnss-rinex
+
+
+# ===================================================================
+# Output rosbags
+# ===================================================================
+
+rosbags:
+
+# street00 rover
+- rosbag:
+    tag: rosbag_rov_street00
+    type: rosbag
+    input_tags: [fmt_rov_street00]
+    path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street00/gici_bags/gnss_rover.bag
+    topic_name: /gnss_rover
+    format: gnss_raw
+    enable_observation: true
+
+# street01 rover
+- rosbag:
+    tag: rosbag_rov_street01
+    type: rosbag
+    input_tags: [fmt_rov_street01]
+    path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street01/gici_bags/gnss_rover.bag
+    topic_name: /gnss_rover
+    format: gnss_raw
+    enable_observation: true
+
+# street02 rover
+- rosbag:
+    tag: rosbag_rov_street02
+    type: rosbag
+    input_tags: [fmt_rov_street02]
+    path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/street02/gici_bags/gnss_rover.bag
+    topic_name: /gnss_rover
+    format: gnss_raw
+    enable_observation: true
+
+# Shared reference
+- rosbag:
+    tag: rosbag_gnss_ref
+    type: rosbag
+    input_tags: [fmt_gnss_ref]
+    path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/gici_bags_common/gnss_reference.bag
+    topic_name: /gnss_reference
+    format: gnss_raw
+    enable_observation: true
+    enable_antenna_position: true
+
+# Shared G/R/E/C broadcast ephemerides
+- rosbag:
+    tag: rosbag_gnss_eph
+    type: rosbag
+    input_tags: [fmt_eph_gps, fmt_eph_glo, fmt_eph_bds, fmt_eph_gal]
+    path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/gici_bags_common/gnss_ephemeris.bag
+    topic_name: /gnss_reference
+    format: gnss_raw
+    enable_ephemeris: true

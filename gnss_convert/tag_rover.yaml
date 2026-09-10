@@ -1,0 +1,9 @@
+# client:
+#   path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250428/base/202504280000.25O
+#   type: gnss-rinex
+#   major_gnss_type: observation
+
+client:
+  path: /media/ym/BLUE/Datasets/RobNav_Dataset/Robot2/i2Nav-Fusion/GNSS/20250429/base/202504290000.25G
+  type: gnss-rinex
+  major_gnss_type: ephemeris
