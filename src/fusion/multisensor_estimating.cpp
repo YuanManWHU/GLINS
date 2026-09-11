@@ -8,6 +8,8 @@
 **/
 #include "gici/fusion/multisensor_estimating.h"
 
+#include <algorithm>
+
 #include "gici/imu/imu_common.h"
 #include "gici/imu/imu_error.h"
 #include "gici/utility/spin_control.h"
@@ -640,7 +642,39 @@ void MultiSensorEstimating::estimatorDataCallback(EstimatorDataCluster& data)
   // temporarily store measurements
   mutex_addin_.lock();
   measurement_addin_buffer_.push_back(data);
+  peak_addin_size_ = std::max(peak_addin_size_, measurement_addin_buffer_.size());
   mutex_addin_.unlock();
+}
+
+void MultiSensorEstimating::notifyInputFinished()
+{
+  input_finished_.store(true);
+}
+
+bool MultiSensorEstimating::pipelineIdle()
+{
+  if (!input_finished_.load() || measurement_busy_.load() ||
+      lidar_frontend_busy_.load() || backend_busy_.load()) {
+    return false;
+  }
+
+  bool addin_empty, align_empty, input_empty, image_empty, lidar_empty, output_empty;
+  { std::lock_guard<std::mutex> lock(mutex_addin_); addin_empty = measurement_addin_buffer_.empty(); }
+  { std::lock_guard<std::mutex> lock(mutex_align_); align_empty = measurement_align_buffer_.empty(); }
+  { std::lock_guard<std::mutex> lock(mutex_input_); input_empty = measurements_.empty(); }
+  { std::lock_guard<std::mutex> lock(mutex_image_input_); image_empty = image_frontend_measurements_.empty(); }
+  { std::lock_guard<std::mutex> lock(mutex_lidar_input_); lidar_empty = lidar_frontend_measurements_.empty(); }
+  { std::lock_guard<std::mutex> lock(mutex_output_); output_empty = output_timestamps_.empty(); }
+  return addin_empty && align_empty && input_empty && image_empty && lidar_empty && output_empty;
+}
+
+MultiSensorEstimating::PipelineQueuePeaks MultiSensorEstimating::pipelineQueuePeaks()
+{
+  PipelineQueuePeaks peaks;
+  { std::lock_guard<std::mutex> lock(mutex_addin_); peaks.addin = peak_addin_size_; }
+  { std::lock_guard<std::mutex> lock(mutex_lidar_input_); peaks.lidar_frontend = peak_lidar_frontend_size_; }
+  { std::lock_guard<std::mutex> lock(mutex_input_); peaks.backend = peak_backend_size_; }
+  return peaks;
 }
 
 // Process funtion in every loop
@@ -774,6 +808,8 @@ void MultiSensorEstimating::handleTimePropagationSensors(EstimatorDataCluster& d
 // Handle non-time-propagation sensors
 void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster& data)
 {
+  {
+    std::lock_guard<std::mutex> lock(mutex_align_);
   // Input align mode
   if (enable_input_align_) {
     // Insert a measurement to addin buffer realigning timestamps
@@ -781,25 +817,26 @@ void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster
     if (!needTimeAlign(type_)) {
       measurement_align_buffer_.push_back(data);
     }
-    else if (measurement_align_buffer_.size() == 0 || 
-        data.timestamp >= measurement_align_buffer_.back().timestamp) {
+    else if (measurement_align_buffer_.empty() ||
+             data.timestamp >= measurement_align_buffer_.back().timestamp) {
       measurement_align_buffer_.push_back(data);
     }
     else if (data.timestamp <= measurement_align_buffer_.front().timestamp) {
       if (data.timestamp < measurement_align_buffer_.back().timestamp - buffer_time) {
-        LOG(WARNING) << "Throughing data at timestamp " << std::fixed << data.timestamp 
-          << " because its latency is too large!";
+        LOG(WARNING) << "Throughing data at timestamp " << std::fixed << data.timestamp
+                     << " because its latency is too large!";
       }
       else {
         measurement_align_buffer_.push_front(data);
       }
     }
-    else
-    for (auto it = measurement_align_buffer_.begin(); 
-          it != measurement_align_buffer_.end(); it++) {
-      if (data.timestamp >= it->timestamp) continue;
-      measurement_align_buffer_.insert(it, data);
-      break;
+    else {
+      for (auto it = measurement_align_buffer_.begin();
+           it != measurement_align_buffer_.end(); ++it) {
+        if (data.timestamp >= it->timestamp) continue;
+        measurement_align_buffer_.insert(it, data);
+        break;
+      }
     }
   }
   // Non-align mode
@@ -807,52 +844,59 @@ void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster
     measurement_align_buffer_.push_back(data);
   }
 
-  // Check if we can add to measurement buffer
-  for (auto it = measurement_align_buffer_.begin(); it != measurement_align_buffer_.end();)
-  {
-    // we delay the data for input_align_latency_ to wait incoming data for realigning.
-    if (measurement_align_buffer_.back().timestamp - 
-        measurement_align_buffer_.front().timestamp < input_align_latency_) break;
+  }
+  releaseAlignedMeasurements();
+}
 
-    // we always add IMU measurement to estimator at a given timestamp before we 
-    // add other sensor measurements.
+void MultiSensorEstimating::releaseAlignedMeasurements()
+{
+  std::lock_guard<std::mutex> align_lock(mutex_align_);
+  for (auto it = measurement_align_buffer_.begin();
+       it != measurement_align_buffer_.end();) {
+    // EOF releases the latency hold but still requires IMU through LiDAR scan end.
+    if (!input_finished_.load() &&
+        measurement_align_buffer_.back().timestamp -
+            measurement_align_buffer_.front().timestamp < input_align_latency_) {
+      break;
+    }
+
     EstimatorDataCluster& measurement = *it;
-    // LiDAR deskew needs IMU coverage through scan end, not only timebase.
     double required_imu_timestamp = measurement.timestamp;
     if (measurement.lidar) {
       required_imu_timestamp = measurement.lidar->timefinal;
     }
+    double latest_imu_timestamp;
+    {
+      std::lock_guard<std::mutex> input_lock(mutex_input_);
+      latest_imu_timestamp = latest_imu_timestamp_;
+    }
     if (estimatorTypeContains(SensorType::IMU, type_) &&
-        required_imu_timestamp > latest_imu_timestamp_) {
-      it++; continue;
+        required_imu_timestamp > latest_imu_timestamp) {
+      ++it;
+      continue;
     }
 
-    mutex_input_.lock();
-
-    // add measurements
+    std::lock_guard<std::mutex> input_lock(mutex_input_);
     measurements_.push_back(measurement);
+    peak_backend_size_ = std::max(peak_backend_size_, measurements_.size());
 
-    // check pending, sparcify if needed
-    if (enable_backend_data_sparsify_)
-    {
+    if (enable_backend_data_sparsify_) {
       if (measurements_.size() > pending_num_threshold_) {
         pending_sparsify_num_++;
       }
-      else if (pending_sparsify_num_ > 0) pending_sparsify_num_--;
+      else if (pending_sparsify_num_ > 0) {
+        pending_sparsify_num_--;
+      }
       if (pending_sparsify_num_) {
-        LOG(WARNING) << "Backend pending! Sparsifying measurements with counter " 
-                    << pending_sparsify_num_ << ".";
-        for (int i = 0; i < pending_sparsify_num_; i++) {
-          // some measurements we cannot erase
-          if (measurements_.front().frame_bundle && 
+        LOG(WARNING) << "Backend pending! Sparsifying measurements with counter "
+                     << pending_sparsify_num_ << ".";
+        for (int i = 0; i < pending_sparsify_num_; ++i) {
+          if (measurements_.front().frame_bundle &&
               measurements_.front().frame_bundle->isKeyframe()) break;
-          // erase front measurement
           if (measurements_.size() > 1) measurements_.pop_front();
         }
       }
     }
-
-    mutex_input_.unlock();
     it = measurement_align_buffer_.erase(it);
   }
 }
@@ -875,6 +919,8 @@ void MultiSensorEstimating::handleLidarFrontendSensors(EstimatorDataCluster& dat
   if (data.lidar->need_frontend) {
     mutex_lidar_input_.lock();
     lidar_frontend_measurements_.push_back(data);
+    peak_lidar_frontend_size_ = std::max(peak_lidar_frontend_size_,
+                                         lidar_frontend_measurements_.size());
     mutex_lidar_input_.unlock();
   }
 }
@@ -907,6 +953,7 @@ void MultiSensorEstimating::putMeasurements()
   else if (data.gnss && data.gnss_role == GnssRole::Reference) {
     mutex_input_.lock();
     measurements_.push_back(data);
+    peak_backend_size_ = std::max(peak_backend_size_, measurements_.size());
     mutex_input_.unlock();
   }
   // other sensors
@@ -1156,6 +1203,7 @@ void MultiSensorEstimating::runLidarFrontend()
       last_lidar_pending_num_ = lidar_frontend_measurements_.size();
     }
 
+    lidar_frontend_busy_.store(true);
     {
       // Coarse timing excludes queue wait and sleep, but covers the complete active frontend work.
       ScopedModuleTimer frontend_timer(TimingModule::LidarFrontendTotal,
@@ -1227,6 +1275,7 @@ void MultiSensorEstimating::runLidarFrontend()
         callback(tag_, data_cluster);
       }
     }
+    lidar_frontend_busy_.store(false);
     spin.sleep();
   }
 }
@@ -1236,7 +1285,11 @@ void MultiSensorEstimating::runMeasurementAddin()
 {
   SpinControl spin(1.0e-4);
   while (!quit_thread_ && SpinControl::ok()) {
+    measurement_busy_.store(true);
     putMeasurements();
+    // After EOF, retry aligned data without waiting for a newer input timestamp.
+    if (input_finished_.load()) releaseAlignedMeasurements();
+    measurement_busy_.store(false);
     spin.sleep();
   }
 }
@@ -1246,7 +1299,9 @@ void MultiSensorEstimating::runBackend()
 {
   SpinControl spin(1.0e-4);
   while (!quit_thread_ && SpinControl::ok()) {
+    backend_busy_.store(true);
     processEstimator();
+    backend_busy_.store(false);
     spin.sleep();
   }
 }

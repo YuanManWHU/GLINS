@@ -89,6 +89,13 @@ public:
   // Get I/O type
   StreamIOType getIoType() { return io_type_; }
 
+  // Direct-bag ingress reuses the same converters as ROS subscribers.
+  void feedImu(const sensor_msgs::ImuConstPtr& msg);
+  void feedHesaiAt128(const sensor_msgs::PointCloud2ConstPtr& msg);
+  void feedGnssObservations(const gici_ros::GnssObservationsConstPtr& msg);
+  void feedGnssEphemerides(const gici_ros::GnssEphemeridesConstPtr& msg);
+  void feedGnssAntennaPosition(const gici_ros::GnssAntennaPositionConstPtr& msg);
+
   // Bind input and logging streams (ROS to ROS)
   static void bindLogWithInput();
 

@@ -19,7 +19,8 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(OpenCV 4 REQUIRED)
 find_package(PCL 1.10 REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
-  roscpp 
+  roscpp
+  rosbag
   std_msgs
   nav_msgs
   sensor_msgs
@@ -69,7 +70,7 @@ add_subdirectory(../../.. gici.out)
 
 catkin_package(
   INCLUDE_DIRS 
-  CATKIN_DEPENDS roscpp std_msgs nav_msgs
+  CATKIN_DEPENDS roscpp rosbag std_msgs nav_msgs
         sensor_msgs geometry_msgs 
         tf tf_conversions cv_bridge
         image_transport eigen_conversions
@@ -89,5 +90,12 @@ aux_source_directory(src/ros_interface DIR_ROS_TOOLS)
 # GICI ROS interface
 add_executable(gici_ros_main
                src/gici_ros_main.cpp ${DIR_ROS_TOOLS})
-target_link_libraries(gici_ros_main 
+target_link_libraries(gici_ros_main
+      gici ${OpenCV_LIBS} ${PCL_LIBRARIES} ${catkin_LIBRARIES})
+
+# Dedicated offline RobNav entry: drives existing ROS stream callbacks from rosbag.
+add_executable(gici_robnav_bag_main
+               src/gici_robnav_bag_main.cpp ${DIR_ROS_TOOLS})
+add_dependencies(gici_robnav_bag_main ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(gici_robnav_bag_main
       gici ${OpenCV_LIBS} ${PCL_LIBRARIES} ${catkin_LIBRARIES})

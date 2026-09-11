@@ -334,6 +334,31 @@ RosStream::RosStream(
 RosStream::~RosStream()
 {}
 
+void RosStream::feedImu(const sensor_msgs::ImuConstPtr& msg)
+{
+  imuCallback(msg);
+}
+
+void RosStream::feedHesaiAt128(const sensor_msgs::PointCloud2ConstPtr& msg)
+{
+  hesaiAt128Callback(msg);
+}
+
+void RosStream::feedGnssObservations(const gici_ros::GnssObservationsConstPtr& msg)
+{
+  gnssObservationsCallback(msg);
+}
+
+void RosStream::feedGnssEphemerides(const gici_ros::GnssEphemeridesConstPtr& msg)
+{
+  gnssEphemeridesCallback(msg);
+}
+
+void RosStream::feedGnssAntennaPosition(const gici_ros::GnssAntennaPositionConstPtr& msg)
+{
+  gnssAntennaPositionCallback(msg);
+}
+
 // Output data callback
 void RosStream::outputDataCallback(
     const std::string tag, const std::shared_ptr<DataCluster>& data)

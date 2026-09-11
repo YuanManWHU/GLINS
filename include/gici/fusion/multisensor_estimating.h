@@ -9,6 +9,7 @@
 #pragma once
 
 #include <iostream>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -48,6 +49,19 @@ public:
   // Reset processors
   void resetProcessors();
 
+  // Direct-bag EOF handling and drain state.
+  void notifyInputFinished();
+  bool pipelineIdle();
+
+  struct PipelineQueuePeaks {
+    size_t addin = 0;
+    size_t lidar_frontend = 0;
+    size_t backend = 0;
+  };
+
+  // Snapshot queue high-water marks for offline-run diagnostics.
+  PipelineQueuePeaks pipelineQueuePeaks();
+
   // Input data callback
   void estimatorDataCallback(EstimatorDataCluster& data) override;
 
@@ -72,6 +86,9 @@ private:
 
   // Put data from addin buffer to measurement buffer
   void putMeasurements();
+
+  // Release aligned data; EOF removes only the latency hold, not IMU coverage.
+  void releaseAlignedMeasurements();
 
   // Process estimator
   bool processEstimator();
@@ -223,7 +240,12 @@ protected:
   double latest_imu_timestamp_;
   // mutex to lock buffers and processes
   std::mutex mutex_addin_, mutex_input_, mutex_image_input_, mutex_lidar_input_;
+  std::mutex mutex_align_;
   std::mutex mutex_output_;
+  // Queue high-water marks are protected by their corresponding queue mutexes.
+  size_t peak_addin_size_ = 0;
+  size_t peak_lidar_frontend_size_ = 0;
+  size_t peak_backend_size_ = 0;
 
   // Options
   EstimatorBaseOptions base_options_;
@@ -251,6 +273,12 @@ protected:
   SppImuCameraRrrEstimatorOptions spp_imu_camera_rrr_options_;
   RtkImuCameraRrrEstimatorOptions rtk_imu_camera_rrr_options_;
   RtkImuLidarRrrEstimatorOptions rtk_imu_lidar_rrr_options_;
+  // Direct-bag pipeline state; false by default to preserve ROS behavior.
+  std::atomic<bool> input_finished_{false};
+  std::atomic<bool> measurement_busy_{false};
+  std::atomic<bool> lidar_frontend_busy_{false};
+  std::atomic<bool> backend_busy_{false};
+
   // Solutions
   bool backend_firstly_updated_ = false;
 };

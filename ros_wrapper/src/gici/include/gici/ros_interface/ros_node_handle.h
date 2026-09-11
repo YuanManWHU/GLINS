@@ -24,6 +24,11 @@ public:
   RosNodeHandle(ros::NodeHandle& nh, const NodeOptionHandlePtr& nodes);
   ~RosNodeHandle();
 
+  // Direct-bag runner obtains the existing input stream by its YAML tag.
+  inline std::shared_ptr<RosStream> getRosStream(const std::string& tag) {
+    return getRosStreamFromTag(tag);
+  }
+
 protected:
   // Bind streamer->formator->ROS-streamer pipelines
   void bindStreamerToFormatorToRosStreamer(const NodeOptionHandlePtr& nodes);
