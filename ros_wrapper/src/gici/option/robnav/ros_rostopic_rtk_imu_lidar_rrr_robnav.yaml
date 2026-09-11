@@ -177,7 +177,7 @@ estimate:
     # RRR
     # ------------------------------------------------------------------------
     rtk_imu_lidar_rrr_options:
-      max_keyframes: 3
+      max_keyframes: 20
       max_gnss_window_length_minor: 3
 
       # LiDAR initialization requires yaw STD <= 0.5 deg.
@@ -314,7 +314,7 @@ estimate:
 
       kfselect_max_rotation: 10.0
       kfselect_max_translation: 10.0
-      kfselect_min_dt: 0.8
+      kfselect_min_dt: 0.3
 
       # IMPORTANT:
       # Although named T_B_L, the YAML value must be T_I_L here because

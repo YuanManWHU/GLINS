@@ -3,6 +3,7 @@
 *
 * Copyright (C) 2026
 **/
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -44,6 +45,62 @@ struct Arguments {
   double start_time_s = 0.0;
   double duration_s = 0.0;
 };
+
+constexpr size_t kAddinHighWatermark = 100;
+constexpr size_t kAddinLowWatermark = 40;
+constexpr auto kBackpressureSleep = std::chrono::milliseconds(1);
+constexpr double kBackendLagHighWatermarkS = 1.5;
+constexpr double kBackendLagLowWatermarkS = 0.8;
+
+struct BackpressureStats {
+  size_t enter_count = 0;
+  double wait_time_s = 0.0;
+  size_t max_addin = 0;
+  size_t backend_enter_count = 0;
+  double backend_wait_time_s = 0.0;
+  double backend_lag_max_s = 0.0;
+};
+
+void applyDirectBackpressure(
+    const std::shared_ptr<gici::MultiSensorEstimating>& estimator,
+    BackpressureStats* stats)
+{
+  auto state = estimator->directInputFlowState();
+  stats->max_addin = std::max(stats->max_addin, state.addin_size);
+  stats->backend_lag_max_s = std::max(stats->backend_lag_max_s, state.backend_lag);
+
+  const bool addin_overloaded = state.addin_size >= kAddinHighWatermark;
+  const bool backend_overloaded = state.backend_lag >= kBackendLagHighWatermarkS;
+  if (!addin_overloaded && !backend_overloaded) {
+    return;
+  }
+
+  // Only addin-triggered pauses need future IMU coverage for the newest raw scan.
+  if (addin_overloaded && !backend_overloaded &&
+      state.latest_input_lidar_timefinal > 0.0 &&
+      state.latest_input_imu_timestamp < state.latest_input_lidar_timefinal) {
+    return;
+  }
+
+  if (addin_overloaded) ++stats->enter_count;
+  if (backend_overloaded) ++stats->backend_enter_count;
+  const auto wait_start = std::chrono::steady_clock::now();
+  while (gici::SpinControl::ok()) {
+    state = estimator->directInputFlowState();
+    stats->max_addin = std::max(stats->max_addin, state.addin_size);
+    stats->backend_lag_max_s = std::max(stats->backend_lag_max_s, state.backend_lag);
+    if (state.addin_size <= kAddinLowWatermark &&
+        state.backend_lag <= kBackendLagLowWatermarkS) {
+      break;
+    }
+    std::this_thread::sleep_for(kBackpressureSleep);
+  }
+
+  const double wait_time_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_start).count();
+  if (addin_overloaded) stats->wait_time_s += wait_time_s;
+  if (backend_overloaded) stats->backend_wait_time_s += wait_time_s;
+}
 
 void printUsage(const char* executable)
 {
@@ -173,6 +230,9 @@ int main(int argc, char** argv)
       return 2;
     }
 
+    // This executable is the direct-bag benchmark, so preserve LiDAR-rover chronology here only.
+    estimator->enableDirectChronologicalAdmissionBarrier(true);
+
     // Existing DCB processing belongs to algorithm initialization and is included in Total.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -197,7 +257,10 @@ int main(int argc, char** argv)
     size_t reference_count = 0;
     ros::Time last_record_time;
     bool has_record_time = false;
+    // Limit diagnostic I/O to one snapshot per 0.5 s of bag record time.
+    double next_diag_time = arguments.start_time_s + 0.5;
     const auto formal_loop_start = std::chrono::steady_clock::now();
+    BackpressureStats backpressure_stats;
     for (const auto& instance : formal_view) {
       if (has_record_time && instance.getTime() < last_record_time) {
         throw std::runtime_error("Merged rosbag view has descending record time.");
@@ -235,9 +298,54 @@ int main(int argc, char** argv)
         reference_stream->feedGnssObservations(message);
         ++reference_count;
       }
+
+      // Throttle only after this message entered the original GLINS pipeline.
+      applyDirectBackpressure(estimator, &backpressure_stats);
+
+      const double input_record_time = instance.getTime().toSec();
+      if (input_record_time >= next_diag_time) {
+        const auto snapshot = estimator->directPipelineSnapshot();
+        LOG(INFO) << std::fixed << std::setprecision(6)
+                  << "[DIRECT_PIPELINE] input=" << input_record_time
+                  << " latest_imu=" << snapshot.latest_imu_timestamp
+                  << " addin=" << snapshot.addin_size
+                  << " addin_front=" << snapshot.oldest_addin_timestamp
+                  << " lidar_q=" << snapshot.lidar_frontend_size
+                  << " lidar_front=" << snapshot.oldest_lidar_frontend_timestamp
+                  << " lidar_active=" << snapshot.active_lidar_timestamp
+                  << " align=" << snapshot.align_size
+                  << " align_front=" << snapshot.oldest_align_timestamp
+                  << " backend_q=" << snapshot.backend_size
+                  << " backend_front=" << snapshot.oldest_backend_timestamp
+                  << " backend_active=" << snapshot.active_backend_timestamp;
+        next_diag_time += 0.5;
+      }
     }
     const auto formal_loop_end = std::chrono::steady_clock::now();
 
+    // Keep normal alignment latency until no ingress or LiDAR frontend work can add data.
+    const auto ingress_drain_start = std::chrono::steady_clock::now();
+    const auto ingress_deadline = ingress_drain_start + std::chrono::seconds(60);
+    bool ingress_quiescent = false;
+    while (std::chrono::steady_clock::now() < ingress_deadline) {
+      if (estimator->readyForFinalAlignmentFlush()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (estimator->readyForFinalAlignmentFlush()) {
+          ingress_quiescent = true;
+          break;
+        }
+      }
+      std::this_thread::sleep_for(kBackpressureSleep);
+    }
+    if (!ingress_quiescent) {
+      throw std::runtime_error(
+          "Timed out while draining direct-input/addin/LiDAR frontend before final alignment flush.");
+    }
+    const double ingress_quiesce_time_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - ingress_drain_start)
+            .count();
+
+    const auto chronological_stats_at_eof = estimator->chronologicalAdmissionStats();
     estimator->notifyInputFinished();
     const auto drain_start = std::chrono::steady_clock::now();
     const auto drain_deadline = drain_start + std::chrono::seconds(60);
@@ -299,6 +407,15 @@ int main(int argc, char** argv)
 
     std::cout << "total_running_time_s=" << total_running_time_s << std::endl
               << "formal_input_loop_time_s=" << formal_input_loop_time_s << std::endl
+              << "backpressure_enter_count=" << backpressure_stats.enter_count << std::endl
+              << "backpressure_wait_time_s=" << backpressure_stats.wait_time_s << std::endl
+              << "backend_lag_max_s=" << backpressure_stats.backend_lag_max_s << std::endl
+              << "backend_backpressure_enter_count="
+              << backpressure_stats.backend_enter_count << std::endl
+              << "backend_backpressure_wait_time_s="
+              << backpressure_stats.backend_wait_time_s << std::endl
+              << "backpressure_max_addin=" << backpressure_stats.max_addin << std::endl
+              << "ingress_quiesce_time_s=" << ingress_quiesce_time_s << std::endl
               << "drain_time_s=" << drain_time_s << std::endl
               << "ephemerides=" << ephemeris_count << ", imu=" << imu_count
               << ", lidar=" << lidar_count << ", rover_gnss=" << rover_count
@@ -308,7 +425,15 @@ int main(int argc, char** argv)
               << std::endl
               << "queue_peak_addin=" << peaks.addin
               << ", queue_peak_lidar_frontend=" << peaks.lidar_frontend
-              << ", queue_peak_backend=" << peaks.backend << std::endl;
+              << ", queue_peak_backend=" << peaks.backend << std::endl
+              << "chronological_barrier_block_count="
+              << chronological_stats_at_eof.rover_gnss_block_count << std::endl
+              << "chronological_barrier_max_gap_s="
+              << chronological_stats_at_eof.max_block_gap_s << std::endl
+              << "pending_lidar_admission_peak="
+              << chronological_stats_at_eof.pending_lidar_peak << std::endl
+              << "pending_lidar_at_eof="
+              << chronological_stats_at_eof.pending_lidar << std::endl;
 
     // Bag close/destruction is intentionally outside the algorithm Total interval.
     sensor_bag.close();

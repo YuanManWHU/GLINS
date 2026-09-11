@@ -13,6 +13,7 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <set>
 #include <functional>
 #include <glog/logging.h>
 
@@ -62,6 +63,54 @@ public:
   // Snapshot queue high-water marks for offline-run diagnostics.
   PipelineQueuePeaks pipelineQueuePeaks();
 
+  // Read-only direct-bag snapshot; timestamps are seconds in the estimator time base.
+  struct DirectPipelineSnapshot {
+    size_t addin_size = 0;
+    size_t align_size = 0;
+    size_t lidar_frontend_size = 0;
+    size_t backend_size = 0;
+
+    double latest_imu_timestamp = 0.0;
+    double oldest_addin_timestamp = 0.0;
+    double oldest_align_timestamp = 0.0;
+    double oldest_lidar_frontend_timestamp = 0.0;
+    double oldest_backend_timestamp = 0.0;
+    double active_lidar_timestamp = 0.0;
+    double active_backend_timestamp = 0.0;
+  };
+
+  DirectPipelineSnapshot directPipelineSnapshot();
+
+  // Lightweight ingress state for the direct-bag feeder only.
+  struct DirectInputFlowState {
+    size_t addin_size = 0;
+    double latest_input_imu_timestamp = 0.0;
+    double latest_input_lidar_timefinal = 0.0;
+
+    // Existing measurement-thread IMU progress and backend work timestamps.
+    double latest_processed_imu_timestamp = 0.0;
+    size_t backend_size = 0;
+    double oldest_backend_timestamp = 0.0;
+    double active_backend_timestamp = 0.0;
+    double backend_lag = 0.0;
+  };
+
+  DirectInputFlowState directInputFlowState();
+
+  struct ChronologicalAdmissionStats {
+    size_t pending_lidar = 0;
+    size_t pending_lidar_peak = 0;
+    size_t rover_gnss_block_count = 0;
+    double max_block_gap_s = 0.0;
+  };
+
+  // Direct-bag only. Disabled by default so the ROS callback path is unchanged.
+  void enableDirectChronologicalAdmissionBarrier(bool enable);
+  ChronologicalAdmissionStats chronologicalAdmissionStats();
+
+  // True when no raw or frontend-produced measurement can enter alignment.
+  bool readyForFinalAlignmentFlush();
+
   // Input data callback
   void estimatorDataCallback(EstimatorDataCluster& data) override;
 
@@ -89,6 +138,13 @@ private:
 
   // Release aligned data; EOF removes only the latency hold, not IMU coverage.
   void releaseAlignedMeasurements();
+
+  // Direct-bag LiDAR-to-rover-GNSS chronological admission bookkeeping.
+  void registerPendingLidarAdmission(double timebase);
+  void completePendingLidarAdmission(double timebase);
+  bool hasPendingLidarOlderThan(double timestamp, double* oldest_timebase);
+  void recordChronologicalBlock(double rover_timestamp, double gap_s);
+  void clearPendingLidarAdmissions();
 
   // Process estimator
   bool processEstimator();
@@ -278,6 +334,21 @@ protected:
   std::atomic<bool> measurement_busy_{false};
   std::atomic<bool> lidar_frontend_busy_{false};
   std::atomic<bool> backend_busy_{false};
+  // Active work is outside queue fronts and needs separate diagnostic timestamps.
+  std::atomic<double> active_lidar_timestamp_{0.0};
+  std::atomic<double> active_backend_timestamp_{0.0};
+  // Raw direct-reader watermarks are distinct from measurement-thread progress.
+  std::atomic<double> latest_input_imu_timestamp_{0.0};
+  std::atomic<double> latest_input_lidar_timefinal_{0.0};
+
+  // Direct-bag only: raw LiDAR remains pending until its processed scan enters alignment.
+  std::atomic<bool> direct_chronological_admission_enabled_{false};
+  std::mutex mutex_lidar_admission_;
+  std::multiset<double> pending_lidar_admission_timebases_;
+  size_t peak_pending_lidar_admission_ = 0;
+  size_t rover_gnss_block_count_ = 0;
+  double max_rover_gnss_block_gap_s_ = 0.0;
+  double last_counted_blocked_rover_timestamp_ = -1.0;
 
   // Solutions
   bool backend_firstly_updated_ = false;

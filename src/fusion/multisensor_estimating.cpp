@@ -9,6 +9,7 @@
 #include "gici/fusion/multisensor_estimating.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "gici/imu/imu_common.h"
 #include "gici/imu/imu_error.h"
@@ -27,6 +28,20 @@
 #include "gici/fusion/rtk_imu_camera_rrr_estimator.h"
 
 namespace gici {
+
+namespace {
+
+// Keeps direct-bag diagnostics accurate on every backend early-return path.
+class ActiveTimestampScope {
+ public:
+  explicit ActiveTimestampScope(std::atomic<double>& timestamp) : timestamp_(timestamp) {}
+  ~ActiveTimestampScope() { timestamp_.store(0.0); }
+
+ private:
+  std::atomic<double>& timestamp_;
+};
+
+}  // namespace
 
 MultiSensorEstimating::MultiSensorEstimating(
   const NodeOptionHandlePtr& nodes, size_t i_estimator) : 
@@ -484,6 +499,7 @@ MultiSensorEstimating::~MultiSensorEstimating()
 // Reset estimator
 void MultiSensorEstimating::resetProcessors()
 {
+  clearPendingLidarAdmissions();
   backend_firstly_updated_ = false;
   mutex_output_.lock();
 
@@ -631,6 +647,80 @@ void MultiSensorEstimating::resetProcessors()
   mutex_output_.unlock();
 }
 
+void MultiSensorEstimating::enableDirectChronologicalAdmissionBarrier(bool enable)
+{
+  direct_chronological_admission_enabled_.store(enable);
+  clearPendingLidarAdmissions();
+}
+
+MultiSensorEstimating::ChronologicalAdmissionStats
+MultiSensorEstimating::chronologicalAdmissionStats()
+{
+  ChronologicalAdmissionStats stats;
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  stats.pending_lidar = pending_lidar_admission_timebases_.size();
+  stats.pending_lidar_peak = peak_pending_lidar_admission_;
+  stats.rover_gnss_block_count = rover_gnss_block_count_;
+  stats.max_block_gap_s = max_rover_gnss_block_gap_s_;
+  return stats;
+}
+
+void MultiSensorEstimating::registerPendingLidarAdmission(double timebase)
+{
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  pending_lidar_admission_timebases_.insert(timebase);
+  peak_pending_lidar_admission_ = std::max(
+      peak_pending_lidar_admission_, pending_lidar_admission_timebases_.size());
+}
+
+void MultiSensorEstimating::completePendingLidarAdmission(double timebase)
+{
+  if (!direct_chronological_admission_enabled_.load()) return;
+
+  constexpr double kTimestampTolerance = 1.0e-6;
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  auto it = pending_lidar_admission_timebases_.lower_bound(
+      timebase - kTimestampTolerance);
+  if (it == pending_lidar_admission_timebases_.end() ||
+      std::abs(*it - timebase) > kTimestampTolerance) {
+    LOG(WARNING) << "Unable to match pending LiDAR admission at "
+                 << std::fixed << timebase;
+    return;
+  }
+  pending_lidar_admission_timebases_.erase(it);
+}
+
+bool MultiSensorEstimating::hasPendingLidarOlderThan(
+    double timestamp, double* oldest_timebase)
+{
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  if (pending_lidar_admission_timebases_.empty() ||
+      *pending_lidar_admission_timebases_.begin() >= timestamp) {
+    return false;
+  }
+  if (oldest_timebase != nullptr) {
+    *oldest_timebase = *pending_lidar_admission_timebases_.begin();
+  }
+  return true;
+}
+
+void MultiSensorEstimating::recordChronologicalBlock(
+    double rover_timestamp, double gap_s)
+{
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  if (std::abs(rover_timestamp - last_counted_blocked_rover_timestamp_) > 1.0e-9) {
+    ++rover_gnss_block_count_;
+    last_counted_blocked_rover_timestamp_ = rover_timestamp;
+  }
+  max_rover_gnss_block_gap_s_ = std::max(max_rover_gnss_block_gap_s_, gap_s);
+}
+
+void MultiSensorEstimating::clearPendingLidarAdmissions()
+{
+  std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+  pending_lidar_admission_timebases_.clear();
+}
+
 // Input data callback
 void MultiSensorEstimating::estimatorDataCallback(EstimatorDataCluster& data)
 {
@@ -639,11 +729,24 @@ void MultiSensorEstimating::estimatorDataCallback(EstimatorDataCluster& data)
     return;
   }
 
-  // temporarily store measurements
-  mutex_addin_.lock();
+  // Raw direct-input watermarks; frontend-produced LiDAR does not advance them.
+  if (data.imu) {
+    latest_input_imu_timestamp_.store(data.timestamp, std::memory_order_relaxed);
+  }
+  if (data.lidar && data.lidar->need_frontend) {
+    latest_input_lidar_timefinal_.store(data.lidar->timefinal,
+                                         std::memory_order_relaxed);
+  }
+
+  // Register before addin visibility so rover GNSS cannot miss raw LiDAR in frontend.
+  if (direct_chronological_admission_enabled_.load() &&
+      data.lidar && data.lidar->need_frontend) {
+    registerPendingLidarAdmission(data.lidar->timebase);
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_addin_);
   measurement_addin_buffer_.push_back(data);
   peak_addin_size_ = std::max(peak_addin_size_, measurement_addin_buffer_.size());
-  mutex_addin_.unlock();
 }
 
 void MultiSensorEstimating::notifyInputFinished()
@@ -665,7 +768,13 @@ bool MultiSensorEstimating::pipelineIdle()
   { std::lock_guard<std::mutex> lock(mutex_image_input_); image_empty = image_frontend_measurements_.empty(); }
   { std::lock_guard<std::mutex> lock(mutex_lidar_input_); lidar_empty = lidar_frontend_measurements_.empty(); }
   { std::lock_guard<std::mutex> lock(mutex_output_); output_empty = output_timestamps_.empty(); }
-  return addin_empty && align_empty && input_empty && image_empty && lidar_empty && output_empty;
+  bool pending_lidar_empty = true;
+  if (direct_chronological_admission_enabled_.load()) {
+    std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+    pending_lidar_empty = pending_lidar_admission_timebases_.empty();
+  }
+  return addin_empty && align_empty && input_empty && image_empty && lidar_empty &&
+         output_empty && pending_lidar_empty;
 }
 
 MultiSensorEstimating::PipelineQueuePeaks MultiSensorEstimating::pipelineQueuePeaks()
@@ -675,6 +784,113 @@ MultiSensorEstimating::PipelineQueuePeaks MultiSensorEstimating::pipelineQueuePe
   { std::lock_guard<std::mutex> lock(mutex_lidar_input_); peaks.lidar_frontend = peak_lidar_frontend_size_; }
   { std::lock_guard<std::mutex> lock(mutex_input_); peaks.backend = peak_backend_size_; }
   return peaks;
+}
+
+MultiSensorEstimating::DirectPipelineSnapshot
+MultiSensorEstimating::directPipelineSnapshot()
+{
+  DirectPipelineSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_addin_);
+    snapshot.addin_size = measurement_addin_buffer_.size();
+    if (!measurement_addin_buffer_.empty()) {
+      snapshot.oldest_addin_timestamp = measurement_addin_buffer_.front().timestamp;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_align_);
+    snapshot.align_size = measurement_align_buffer_.size();
+    if (!measurement_align_buffer_.empty()) {
+      snapshot.oldest_align_timestamp = measurement_align_buffer_.front().timestamp;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_lidar_input_);
+    snapshot.lidar_frontend_size = lidar_frontend_measurements_.size();
+    if (!lidar_frontend_measurements_.empty()) {
+      snapshot.oldest_lidar_frontend_timestamp =
+          lidar_frontend_measurements_.front().timestamp;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_input_);
+    snapshot.backend_size = measurements_.size();
+    snapshot.latest_imu_timestamp = latest_imu_timestamp_;
+    if (!measurements_.empty()) {
+      snapshot.oldest_backend_timestamp = measurements_.front().timestamp;
+    }
+  }
+  snapshot.active_lidar_timestamp = active_lidar_timestamp_.load();
+  snapshot.active_backend_timestamp = active_backend_timestamp_.load();
+  return snapshot;
+}
+
+MultiSensorEstimating::DirectInputFlowState
+MultiSensorEstimating::directInputFlowState()
+{
+  DirectInputFlowState state;
+  {
+    std::lock_guard<std::mutex> lock(mutex_addin_);
+    state.addin_size = measurement_addin_buffer_.size();
+  }
+  state.latest_input_imu_timestamp =
+      latest_input_imu_timestamp_.load(std::memory_order_relaxed);
+  state.latest_input_lidar_timefinal =
+      latest_input_lidar_timefinal_.load(std::memory_order_relaxed);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_input_);
+    state.latest_processed_imu_timestamp = latest_imu_timestamp_;
+    state.backend_size = measurements_.size();
+    if (!measurements_.empty()) {
+      state.oldest_backend_timestamp = measurements_.front().timestamp;
+    }
+  }
+  state.active_backend_timestamp = active_backend_timestamp_.load();
+
+  double earliest_backend_timestamp = 0.0;
+  for (const double timestamp : {state.oldest_backend_timestamp,
+                                 state.active_backend_timestamp}) {
+    if (timestamp > 0.0 &&
+        (earliest_backend_timestamp == 0.0 || timestamp < earliest_backend_timestamp)) {
+      earliest_backend_timestamp = timestamp;
+    }
+  }
+  if (earliest_backend_timestamp > 0.0) {
+    state.backend_lag =
+        state.latest_processed_imu_timestamp - earliest_backend_timestamp;
+  }
+  return state;
+}
+
+bool MultiSensorEstimating::readyForFinalAlignmentFlush()
+{
+  if (measurement_busy_.load() || lidar_frontend_busy_.load()) {
+    return false;
+  }
+
+  bool addin_empty;
+  bool lidar_empty;
+  {
+    std::lock_guard<std::mutex> lock(mutex_addin_);
+    addin_empty = measurement_addin_buffer_.empty();
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_lidar_input_);
+    lidar_empty = lidar_frontend_measurements_.empty();
+  }
+
+  if (!addin_empty || !lidar_empty) {
+    return false;
+  }
+
+  if (direct_chronological_admission_enabled_.load()) {
+    std::lock_guard<std::mutex> lock(mutex_lidar_admission_);
+    if (!pending_lidar_admission_timebases_.empty()) return false;
+  }
+
+  // A worker may have popped an item between the first busy check and queue reads.
+  return !measurement_busy_.load() && !lidar_frontend_busy_.load();
 }
 
 // Process funtion in every loop
@@ -808,42 +1024,54 @@ void MultiSensorEstimating::handleTimePropagationSensors(EstimatorDataCluster& d
 // Handle non-time-propagation sensors
 void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster& data)
 {
+  const bool direct_ordered = direct_chronological_admission_enabled_.load();
   {
     std::lock_guard<std::mutex> lock(mutex_align_);
-  // Input align mode
-  if (enable_input_align_) {
-    // Insert a measurement to addin buffer realigning timestamps
-    const double buffer_time = 2.0 * input_align_latency_;
-    if (!needTimeAlign(type_)) {
-      measurement_align_buffer_.push_back(data);
+    if (direct_ordered) {
+      // Frontend-produced LiDAR may arrive after newer GNSS; admit it by data time.
+      auto position = std::upper_bound(
+          measurement_align_buffer_.begin(), measurement_align_buffer_.end(), data.timestamp,
+          [](double timestamp, const EstimatorDataCluster& item) {
+            return timestamp < item.timestamp;
+          });
+      measurement_align_buffer_.insert(position, data);
     }
-    else if (measurement_align_buffer_.empty() ||
-             data.timestamp >= measurement_align_buffer_.back().timestamp) {
-      measurement_align_buffer_.push_back(data);
-    }
-    else if (data.timestamp <= measurement_align_buffer_.front().timestamp) {
-      if (data.timestamp < measurement_align_buffer_.back().timestamp - buffer_time) {
-        LOG(WARNING) << "Throughing data at timestamp " << std::fixed << data.timestamp
-                     << " because its latency is too large!";
+    else if (enable_input_align_) {
+      // Keep the original upstream latency-rejection behavior for ROS input.
+      const double buffer_time = 2.0 * input_align_latency_;
+      if (!needTimeAlign(type_)) {
+        measurement_align_buffer_.push_back(data);
+      }
+      else if (measurement_align_buffer_.empty() ||
+               data.timestamp >= measurement_align_buffer_.back().timestamp) {
+        measurement_align_buffer_.push_back(data);
+      }
+      else if (data.timestamp <= measurement_align_buffer_.front().timestamp) {
+        if (data.timestamp < measurement_align_buffer_.back().timestamp - buffer_time) {
+          LOG(WARNING) << "Throughing data at timestamp " << std::fixed << data.timestamp
+                       << " because its latency is too large!";
+        }
+        else {
+          measurement_align_buffer_.push_front(data);
+        }
       }
       else {
-        measurement_align_buffer_.push_front(data);
+        for (auto it = measurement_align_buffer_.begin();
+             it != measurement_align_buffer_.end(); ++it) {
+          if (data.timestamp >= it->timestamp) continue;
+          measurement_align_buffer_.insert(it, data);
+          break;
+        }
       }
     }
     else {
-      for (auto it = measurement_align_buffer_.begin();
-           it != measurement_align_buffer_.end(); ++it) {
-        if (data.timestamp >= it->timestamp) continue;
-        measurement_align_buffer_.insert(it, data);
-        break;
-      }
+      measurement_align_buffer_.push_back(data);
     }
   }
-  // Non-align mode
-  else {
-    measurement_align_buffer_.push_back(data);
-  }
 
+  // Only removal after ordered insertion makes the raw LiDAR safe to pass by rover GNSS.
+  if (direct_ordered && data.lidar && !data.lidar->need_frontend) {
+    completePendingLidarAdmission(data.lidar->timebase);
   }
   releaseAlignedMeasurements();
 }
@@ -851,6 +1079,7 @@ void MultiSensorEstimating::handleNonTimePropagationSensors(EstimatorDataCluster
 void MultiSensorEstimating::releaseAlignedMeasurements()
 {
   std::lock_guard<std::mutex> align_lock(mutex_align_);
+  const bool direct_ordered = direct_chronological_admission_enabled_.load();
   for (auto it = measurement_align_buffer_.begin();
        it != measurement_align_buffer_.end();) {
     // EOF releases the latency hold but still requires IMU through LiDAR scan end.
@@ -861,6 +1090,17 @@ void MultiSensorEstimating::releaseAlignedMeasurements()
     }
 
     EstimatorDataCluster& measurement = *it;
+    if (direct_ordered && measurement.gnss &&
+        measurement.gnss_role == GnssRole::Rover) {
+      double oldest_pending_lidar = 0.0;
+      if (hasPendingLidarOlderThan(measurement.timestamp, &oldest_pending_lidar)) {
+        recordChronologicalBlock(
+            measurement.timestamp, measurement.timestamp - oldest_pending_lidar);
+        // The direct alignment buffer is timestamp-ordered, so newer data cannot bypass rover GNSS.
+        break;
+      }
+    }
+
     double required_imu_timestamp = measurement.timestamp;
     if (measurement.lidar) {
       required_imu_timestamp = measurement.lidar->timefinal;
@@ -872,6 +1112,10 @@ void MultiSensorEstimating::releaseAlignedMeasurements()
     }
     if (estimatorTypeContains(SensorType::IMU, type_) &&
         required_imu_timestamp > latest_imu_timestamp) {
+      if (direct_ordered) {
+        // Do not let newer rover GNSS bypass an older scan waiting for end-of-scan IMU.
+        break;
+      }
       ++it;
       continue;
     }
@@ -973,6 +1217,9 @@ bool MultiSensorEstimating::processEstimator()
   EstimatorDataCluster measurement = measurements_.front();
   measurements_.pop_front();
   mutex_input_.unlock();
+
+  active_backend_timestamp_.store(measurement.timestamp);
+  const ActiveTimestampScope active_backend_scope(active_backend_timestamp_);
 
   // Check pending
   if (measurements_.size() > 5) {
@@ -1179,17 +1426,29 @@ void MultiSensorEstimating::runLidarFrontend()
     }
     EstimatorDataCluster& front_measurement = lidar_frontend_measurements_.front();
     if (front_measurement.lidar_role != LidarRole::Front) {
+      const double dropped_timebase = front_measurement.lidar->timebase;
       lidar_frontend_measurements_.pop_front();
       mutex_lidar_input_.unlock();
+      if (direct_chronological_admission_enabled_.load()) {
+        completePendingLidarAdmission(dropped_timebase);
+        LOG(WARNING) << "Dropped LiDAR removed from chronological admission tracker at "
+                     << std::fixed << dropped_timebase;
+      }
       spin.sleep();
       continue;
     }
 
     // Check loop back
     if (front_measurement.timestamp < last_lidar_timestamp) {
+      const double dropped_timebase = front_measurement.lidar->timebase;
       LOG(WARNING) << "LiDAR loop back, remove this scan!";
       lidar_frontend_measurements_.pop_front();
       mutex_lidar_input_.unlock();
+      if (direct_chronological_admission_enabled_.load()) {
+        completePendingLidarAdmission(dropped_timebase);
+        LOG(WARNING) << "Dropped LiDAR removed from chronological admission tracker at "
+                     << std::fixed << dropped_timebase;
+      }
       spin.sleep();
       continue;
     }
@@ -1203,8 +1462,10 @@ void MultiSensorEstimating::runLidarFrontend()
       last_lidar_pending_num_ = lidar_frontend_measurements_.size();
     }
 
+    active_lidar_timestamp_.store(front_measurement.timestamp);
     lidar_frontend_busy_.store(true);
     {
+      const ActiveTimestampScope active_lidar_scope(active_lidar_timestamp_);
       // Coarse timing excludes queue wait and sleep, but covers the complete active frontend work.
       ScopedModuleTimer frontend_timer(TimingModule::LidarFrontendTotal,
                                        front_measurement.lidar->timefinal, TimingTrigger::Lidar,
