@@ -4,11 +4,14 @@
 * Copyright (C) 2026
 **/
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include <ros/ros.h>
@@ -17,6 +20,7 @@
 
 #include "gici/fusion/multisensor_estimating.h"
 #include "gici/ros_interface/ros_node_handle.h"
+#include "gici/utility/experiment_recorder.h"
 #include "gici/utility/node_option_handle.h"
 #include "gici/utility/signal_handle.h"
 #include "gici/utility/spin_control.h"
@@ -106,67 +110,16 @@ int main(int argc, char** argv)
     return 2;
   }
 
-  auto node_options = std::make_shared<gici::NodeOptionHandle>(yaml_node);
-  if (!node_options->valid) {
-    std::cerr << "Invalid configuration: " << arguments.config << std::endl;
-    return 2;
-  }
-
-  std::unique_ptr<gici::RosNodeHandle> node_handle(
-      new gici::RosNodeHandle(nh, node_options));
-  // Start existing streamer and estimator workers; this runner never calls ros::spin().
-  gici::SpinControl::run();
-  auto imu_stream = node_handle->getRosStream("str_ros_imu");
-  auto lidar_stream = node_handle->getRosStream("str_ros_lidar");
-  auto rover_stream = node_handle->getRosStream("str_ros_gnss_rov");
-  auto reference_stream = node_handle->getRosStream("str_ros_gnss_ref");
-  if (!imu_stream || !lidar_stream || !rover_stream || !reference_stream) {
-    std::cerr << "RobNav input streams are missing; expected tags str_ros_imu, "
-              << "str_ros_lidar, str_ros_gnss_rov, str_ros_gnss_ref." << std::endl;
-    gici::SpinControl::kill();
-    return 2;
-  }
-
-  std::shared_ptr<gici::MultiSensorEstimating> estimator;
-  for (const auto& estimating : node_handle->getEstimatings()) {
-    estimator = std::dynamic_pointer_cast<gici::MultiSensorEstimating>(estimating);
-    if (estimator) break;
-  }
-  if (!estimator) {
-    std::cerr << "No multi-sensor estimator was initialized." << std::endl;
-    gici::SpinControl::kill();
-    return 2;
-  }
-
-  // Allow existing static file streamers, including DCB, to complete initialization.
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+  // GRLINS opens bags and creates views before MSCKF construction starts its timer.
+  const ros::Time start_time = timeFromSec(arguments.start_time_s);
+  const ros::Time end_time = timeFromSec(arguments.start_time_s + arguments.duration_s);
+  const char* result_dir = std::getenv("GLINS_RESULT_DIR");
   try {
     rosbag::Bag sensor_bag(arguments.sensor_bag, rosbag::bagmode::Read);
     rosbag::Bag rover_bag(arguments.rover_bag, rosbag::bagmode::Read);
     rosbag::Bag reference_bag(arguments.reference_bag, rosbag::bagmode::Read);
     rosbag::Bag ephemeris_bag(arguments.ephemeris_bag, rosbag::bagmode::Read);
 
-    size_t ephemeris_count = 0;
-    rosbag::View ephemeris_view(ephemeris_bag,
-                                rosbag::TopicQuery({arguments.ephemerides_topic}));
-    for (const auto& instance : ephemeris_view) {
-      auto message = instance.instantiate<gici_ros::GnssEphemerides>();
-      if (!message) {
-        throw std::runtime_error("Invalid ephemerides message in rosbag.");
-      }
-      reference_stream->feedGnssEphemerides(message);
-      ++ephemeris_count;
-    }
-
-    gici_ros::GnssAntennaPositionPtr antenna_message(
-        new gici_ros::GnssAntennaPosition());
-    antenna_message->pos = {arguments.base_ecef_x, arguments.base_ecef_y,
-                            arguments.base_ecef_z};
-    reference_stream->feedGnssAntennaPosition(antenna_message);
-
-    const ros::Time start_time = timeFromSec(arguments.start_time_s);
-    const ros::Time end_time = timeFromSec(arguments.start_time_s + arguments.duration_s);
     rosbag::View formal_view;
     formal_view.addQuery(sensor_bag,
                          rosbag::TopicQuery({arguments.imu_topic, arguments.lidar_topic}),
@@ -176,6 +129,67 @@ int main(int argc, char** argv)
     formal_view.addQuery(reference_bag,
                          rosbag::TopicQuery({arguments.reference_observations_topic}),
                          start_time, end_time);
+    // Preload only records before the formal interval; later ephemerides are time-dependent.
+    rosbag::View ephemeris_preload_view(
+        ephemeris_bag, rosbag::TopicQuery({arguments.ephemerides_topic}),
+        ros::Time(), start_time);
+    formal_view.addQuery(ephemeris_bag, rosbag::TopicQuery({arguments.ephemerides_topic}),
+                         start_time, end_time);
+
+    // Match GRLINS: algorithm construction through normal output finalization is measured.
+    using TotalClock = std::chrono::system_clock;
+    const auto total_start = TotalClock::now();
+
+    auto node_options = std::make_shared<gici::NodeOptionHandle>(yaml_node);
+    if (!node_options->valid) {
+      std::cerr << "Invalid configuration: " << arguments.config << std::endl;
+      return 2;
+    }
+
+    std::unique_ptr<gici::RosNodeHandle> node_handle(
+        new gici::RosNodeHandle(nh, node_options));
+    // This runner drives callbacks directly and deliberately does not call ros::spin().
+    gici::SpinControl::run();
+
+    auto imu_stream = node_handle->getRosStream("str_ros_imu");
+    auto lidar_stream = node_handle->getRosStream("str_ros_lidar");
+    auto rover_stream = node_handle->getRosStream("str_ros_gnss_rov");
+    auto reference_stream = node_handle->getRosStream("str_ros_gnss_ref");
+    if (!imu_stream || !lidar_stream || !rover_stream || !reference_stream) {
+      std::cerr << "RobNav input streams are missing; expected tags str_ros_imu, "
+                << "str_ros_lidar, str_ros_gnss_rov, str_ros_gnss_ref." << std::endl;
+      gici::SpinControl::kill();
+      return 2;
+    }
+
+    std::shared_ptr<gici::MultiSensorEstimating> estimator;
+    for (const auto& estimating : node_handle->getEstimatings()) {
+      estimator = std::dynamic_pointer_cast<gici::MultiSensorEstimating>(estimating);
+      if (estimator) break;
+    }
+    if (!estimator) {
+      std::cerr << "No multi-sensor estimator was initialized." << std::endl;
+      gici::SpinControl::kill();
+      return 2;
+    }
+
+    // Existing DCB processing belongs to algorithm initialization and is included in Total.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    size_t ephemeris_count = 0;
+    size_t ephemeris_preload_count = 0;
+    for (const auto& instance : ephemeris_preload_view) {
+      auto message = instance.instantiate<gici_ros::GnssEphemerides>();
+      if (!message) throw std::runtime_error("Invalid ephemerides message in rosbag.");
+      reference_stream->feedGnssEphemerides(message);
+      ++ephemeris_count;
+      ++ephemeris_preload_count;
+    }
+
+    gici_ros::GnssAntennaPositionPtr antenna_message(new gici_ros::GnssAntennaPosition());
+    antenna_message->pos = {arguments.base_ecef_x, arguments.base_ecef_y,
+                            arguments.base_ecef_z};
+    reference_stream->feedGnssAntennaPosition(antenna_message);
 
     size_t imu_count = 0;
     size_t lidar_count = 0;
@@ -183,7 +197,7 @@ int main(int argc, char** argv)
     size_t reference_count = 0;
     ros::Time last_record_time;
     bool has_record_time = false;
-    const auto wall_start = std::chrono::steady_clock::now();
+    const auto formal_loop_start = std::chrono::steady_clock::now();
     for (const auto& instance : formal_view) {
       if (has_record_time && instance.getTime() < last_record_time) {
         throw std::runtime_error("Merged rosbag view has descending record time.");
@@ -191,7 +205,13 @@ int main(int argc, char** argv)
       last_record_time = instance.getTime();
       has_record_time = true;
 
-      if (instance.getTopic() == arguments.imu_topic) {
+      if (instance.getTopic() == arguments.ephemerides_topic) {
+        auto message = instance.instantiate<gici_ros::GnssEphemerides>();
+        if (!message) throw std::runtime_error("Invalid ephemerides message in rosbag.");
+        reference_stream->feedGnssEphemerides(message);
+        ++ephemeris_count;
+      }
+      else if (instance.getTopic() == arguments.imu_topic) {
         auto message = instance.instantiate<sensor_msgs::Imu>();
         if (!message) throw std::runtime_error("Invalid IMU message in rosbag.");
         imu_stream->feedImu(message);
@@ -216,31 +236,27 @@ int main(int argc, char** argv)
         ++reference_count;
       }
     }
+    const auto formal_loop_end = std::chrono::steady_clock::now();
 
     estimator->notifyInputFinished();
-    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    std::chrono::steady_clock::time_point idle_candidate;
-    bool has_idle_candidate = false;
+    const auto drain_start = std::chrono::steady_clock::now();
+    const auto drain_deadline = drain_start + std::chrono::seconds(60);
+    bool idle_once = false;
     bool drained = false;
-    std::chrono::steady_clock::time_point wall_end;
     while (std::chrono::steady_clock::now() < drain_deadline) {
-      const auto now = std::chrono::steady_clock::now();
       if (estimator->pipelineIdle()) {
-        if (!has_idle_candidate) {
-          idle_candidate = now;
-          has_idle_candidate = true;
-        }
-        else if (now - idle_candidate >= std::chrono::milliseconds(100)) {
-          wall_end = idle_candidate;
+        if (idle_once) {
           drained = true;
           break;
         }
+        idle_once = true;
       }
       else {
-        has_idle_candidate = false;
+        idle_once = false;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    const auto drain_end = std::chrono::steady_clock::now();
 
     if (!drained) {
       std::cerr << "Timed out while draining the estimator pipeline." << std::endl;
@@ -250,16 +266,51 @@ int main(int argc, char** argv)
     }
 
     const auto peaks = estimator->pipelineQueuePeaks();
-    const double wall_processing_time_s =
-        std::chrono::duration<double>(wall_end - wall_start).count();
-    std::cout << "direct_bag_wall_processing_time_s=" << wall_processing_time_s << std::endl
+
+    // Stop and join all workers before the explicit, idempotent recorder flush.
+    gici::SpinControl::kill();
+    estimator.reset();
+    imu_stream.reset();
+    lidar_stream.reset();
+    rover_stream.reset();
+    reference_stream.reset();
+    node_handle.reset();
+    gici::ExperimentRecorder::instance().flush();
+
+    const auto total_end = TotalClock::now();
+    const double total_running_time_s =
+        std::chrono::duration<double>(total_end - total_start).count();
+    const double formal_input_loop_time_s =
+        std::chrono::duration<double>(formal_loop_end - formal_loop_start).count();
+    const double drain_time_s =
+        std::chrono::duration<double>(drain_end - drain_start).count();
+
+    // Writing Total itself is necessarily outside its own measured interval.
+    if (result_dir != nullptr && result_dir[0] != 0) {
+      std::ofstream total_file(std::string(result_dir) + "/total_running_time.txt");
+      if (!total_file.is_open()) {
+        std::cerr << "Unable to write total running time to " << result_dir << std::endl;
+      }
+      else {
+        total_file << std::fixed << std::setprecision(9)
+                   << "total_running_time_s=" << total_running_time_s << "\n";
+      }
+    }
+
+    std::cout << "total_running_time_s=" << total_running_time_s << std::endl
+              << "formal_input_loop_time_s=" << formal_input_loop_time_s << std::endl
+              << "drain_time_s=" << drain_time_s << std::endl
               << "ephemerides=" << ephemeris_count << ", imu=" << imu_count
               << ", lidar=" << lidar_count << ", rover_gnss=" << rover_count
               << ", reference_gnss=" << reference_count << std::endl
+              << "ephemerides_preload=" << ephemeris_preload_count
+              << ", ephemerides_formal=" << ephemeris_count - ephemeris_preload_count
+              << std::endl
               << "queue_peak_addin=" << peaks.addin
               << ", queue_peak_lidar_frontend=" << peaks.lidar_frontend
               << ", queue_peak_backend=" << peaks.backend << std::endl;
 
+    // Bag close/destruction is intentionally outside the algorithm Total interval.
     sensor_bag.close();
     rover_bag.close();
     reference_bag.close();
@@ -272,7 +323,6 @@ int main(int argc, char** argv)
     return 3;
   }
 
-  gici::SpinControl::kill();
   ros::shutdown();
   return 0;
 }
